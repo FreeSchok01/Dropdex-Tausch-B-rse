@@ -20,15 +20,7 @@ Fallbacks (falls das automatische Laden mal blockiert wird):
   - Seitentext aus dem Browser kopieren und einfügen
   - Seite speichern (Strg+S) und die .html-Datei hochladen
 
-Discord-Benachrichtigungen (optional):
-  Webhook-URL NICHT in den Code schreiben. Am einfachsten in der App: "🔐 Admin · Profile verwalten"
-  -> "Discord-Webhook" (wird in dropdex_settings.json gespeichert). Alternativ:
-    - Umgebungsvariable  DISCORD_WEBHOOK_URL   oder
-    - Streamlit-Secret   .streamlit/secrets.toml  ->  DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..."
-  Danach bei "Mein Profil" die Checkbox "Discord-Benachrichtigungen" aktivieren.
-  Der Wächter läuft im Server-Prozess (Intervall: DROPDEX_WATCH_INTERVAL in Sekunden, Standard 300).
-
-Benötigt:  pip install "streamlit>=1.37" requests pandas
+Benötigt:  pip install streamlit requests pandas
 """
 
 import hmac
@@ -36,9 +28,6 @@ import html as html_lib
 import json
 import os
 import re
-import threading
-import time
-from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -596,19 +585,8 @@ def normalize_url(url_or_id: str) -> str:
     return f"https://dropdex.de/de/u/{url_or_id}"
 
 
-_PAGE_CACHE: Dict[str, Tuple[float, str]] = {}
-_PAGE_CACHE_LOCK = threading.Lock()
-PAGE_CACHE_TTL = 60  # Sekunden
-
-
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_page(url: str) -> str:
-    """Lädt eine Seite (60 s zwischengespeichert). Eigener Cache statt st.cache_data, damit die Funktion
-    auch aus dem Hintergrund-Wächter (eigener Thread) funktioniert."""
-    now = time.time()
-    with _PAGE_CACHE_LOCK:
-        hit = _PAGE_CACHE.get(url)
-        if hit and now - hit[0] < PAGE_CACHE_TTL:
-            return hit[1]
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -621,8 +599,6 @@ def fetch_page(url: str) -> str:
             resp = requests.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
             resp.encoding = "utf-8"
-            with _PAGE_CACHE_LOCK:
-                _PAGE_CACHE[url] = (time.time(), resp.text)
             return resp.text
         except requests.RequestException as e:  # noqa: PERF203
             last_err = e
@@ -3336,7 +3312,6 @@ def load_search_pool(me_url: str, me_label: str, partners: Dict[str, str], progr
         pool["partners"][url] = {"label": name, "layers": layers, "error": err}
     if progress:
         progress(1.0, "Fertig")
-    pool["loaded_at"] = time.time()
     return pool
 
 
@@ -3396,395 +3371,11 @@ def search_partners(
     return partners, singles
 
 
-# ----------------------------------------------------------------------------
-# 7) Festes Profil, Auto-Aktualisierung & Discord-Benachrichtigungen
-# ----------------------------------------------------------------------------
-
-WATCH_FILE = "dropdex_watch.json"   # {Profil-URL: Name} – für diese Profile laufen die Discord-Meldungen
-STATE_FILE = "dropdex_state.json"   # letzter bekannter Stand je überwachtem Profil
-SETTINGS_FILE = "dropdex_settings.json"  # u. a. Discord-Webhook (im Admin-Bereich eingetragen)
-_SECRET_WEBHOOK = ""  # Zwischenspeicher für den Secrets-Wert (auch für den Hintergrund-Thread)
-WATCH_INTERVAL_S = max(60, int(os.environ.get("DROPDEX_WATCH_INTERVAL", "300") or 300))
-DISCORD_PREFIXES = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")
-# True  = Meldung nur, wenn du die Karte wirklich 1:1 tauschen kannst (Partner hat sie doppelt UND braucht
-#         eine deiner Dubletten). False = Meldung, sobald irgendein Partner die fehlende Karte doppelt hat.
-NOTIFY_ONLY_TRADEABLE = True
-
-_FILE_LOCK = threading.Lock()
-_CHECK_LOCK = threading.Lock()
-
-
-def _load_json(path: str, default: Any) -> Any:
-    try:
-        with _FILE_LOCK, open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:  # noqa: BLE001
-        return default
-
-
-def _save_json(path: str, data: Any) -> bool:
-    tmp = path + ".tmp"
-    try:
-        with _FILE_LOCK:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, path)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def get_discord_webhook() -> str:
-    """Webhook-URL. Reihenfolge: im Admin-Bereich gespeichert (dropdex_settings.json) ->
-    Umgebungsvariable DISCORD_WEBHOOK_URL -> Streamlit-Secret DISCORD_WEBHOOK_URL."""
-    global _SECRET_WEBHOOK
-    settings = _load_json(SETTINGS_FILE, {})
-    url = str(settings.get("discord_webhook", "")).strip() if isinstance(settings, dict) else ""
-    if not url:
-        url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if not url:
-        try:
-            _SECRET_WEBHOOK = str(st.secrets.get("DISCORD_WEBHOOK_URL", "")).strip() or _SECRET_WEBHOOK
-        except Exception:  # noqa: BLE001 – keine secrets.toml / kein Streamlit-Kontext (Thread)
-            pass
-        url = _SECRET_WEBHOOK
-    return url if url.startswith(DISCORD_PREFIXES) else ""
-
-
-def _admin_save_webhook() -> None:
-    url = st.session_state.get("admin_webhook", "").strip()
-    if not url.startswith(DISCORD_PREFIXES):
-        st.session_state["webhook_msg"] = ("error", "Das ist keine Discord-Webhook-URL "
-                                           "(sie beginnt mit https://discord.com/api/webhooks/).")
-        return
-    settings = _load_json(SETTINGS_FILE, {})
-    settings = settings if isinstance(settings, dict) else {}
-    settings["discord_webhook"] = url
-    ok = _save_json(SETTINGS_FILE, settings)
-    st.session_state["admin_webhook"] = ""
-    st.session_state["webhook_msg"] = ("success", "Webhook gespeichert.") if ok else \
-        ("error", "Speichern fehlgeschlagen (Schreibrechte?).")
-
-
-def _admin_delete_webhook() -> None:
-    settings = _load_json(SETTINGS_FILE, {})
-    if isinstance(settings, dict) and "discord_webhook" in settings:
-        settings.pop("discord_webhook")
-        _save_json(SETTINGS_FILE, settings)
-    st.session_state["webhook_msg"] = ("success", "Webhook entfernt.")
-
-
-def render_webhook_admin() -> None:
-    """Admin-Bereich: Discord-Webhook selbst eintragen, testen, entfernen."""
-    st.markdown("**🔔 Discord-Webhook**")
-    msg = st.session_state.pop("webhook_msg", None)
-    if msg:
-        (st.success if msg[0] == "success" else st.error)(msg[1])
-    cur = get_discord_webhook()
-    saved_here = bool(_load_json(SETTINGS_FILE, {}).get("discord_webhook"))
-    if cur:
-        st.caption(f"Aktiv: …{cur[-6:]} ({'hier gespeichert' if saved_here else 'aus Secrets/Umgebungsvariable'})")
-    else:
-        st.caption("Noch kein Webhook hinterlegt.")
-    st.text_input("Webhook-URL", type="password", key="admin_webhook",
-                  placeholder="https://discord.com/api/webhooks/…", label_visibility="collapsed")
-    w1, w2, w3 = st.columns(3)
-    with w1:
-        st.button("💾 Webhook speichern", key="admin_wh_save", on_click=_admin_save_webhook)
-    with w2:
-        if st.button("📨 Test senden", key="admin_wh_test", disabled=not cur):
-            st.success("Gesendet!") if send_discord(cur, "✅ Test von der Dropdex-Tauschbörse.") \
-                else st.error("Senden fehlgeschlagen – Webhook prüfen.")
-    with w3:
-        st.button("🗑️ Webhook entfernen", key="admin_wh_del", on_click=_admin_delete_webhook, disabled=not saved_here)
-    st.divider()
-
-
-def _chunk_lines(lines: List[str], limit: int = 1900) -> List[str]:
-    chunks: List[str] = []
-    cur = ""
-    for ln in lines:
-        ln = ln[:limit]
-        if cur and len(cur) + len(ln) + 1 > limit:
-            chunks.append(cur)
-            cur = ln
-        else:
-            cur = f"{cur}\n{ln}" if cur else ln
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def send_discord(webhook: str, text: str) -> bool:
-    """Schickt Text an den Discord-Webhook (lange Texte werden gesplittet, 429-Limits abgewartet).
-    @everyone/@here in Kartennamen werden per allowed_mentions unschädlich gemacht."""
-    if not webhook or not text.strip():
-        return False
-    ok = True
-    for chunk in _chunk_lines(text.split("\n")):
-        sent = False
-        for _ in range(3):
-            try:
-                r = requests.post(
-                    webhook,
-                    json={"content": chunk, "username": "Dropdex Tausch-Bot", "allowed_mentions": {"parse": []}},
-                    timeout=15,
-                )
-            except requests.RequestException:
-                break
-            if r.status_code == 429:
-                try:
-                    wait = float(r.json().get("retry_after", 1))
-                except Exception:  # noqa: BLE001
-                    wait = 1.0
-                time.sleep(min(wait, 10))
-                continue
-            sent = r.status_code < 300
-            break
-        ok = ok and sent
-        time.sleep(0.4)
-    return ok
-
-
-def _card_desc(c: Dict[str, Any]) -> str:
-    bits: List[str] = []
-    if c.get("rarity") and c["rarity"] != "UNKNOWN":
-        bits.append(RARITY_LABEL_DE.get(c["rarity"], c["rarity"]))
-    if c.get("deck"):
-        bits.append(str(c["deck"]))
-    if c.get("streamer"):
-        bits.append("🎥 " + str(c["streamer"]))
-    return f"**{c['name']}**" + (f" ({' · '.join(bits)})" if bits else "")
-
-
-def snapshot_inventory(inv: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {
-        c["id"]: {"count": c["count"], "name": c["name"], "rarity": c["rarity"],
-                  "deck": c.get("deck", ""), "streamer": c.get("streamer", "")}
-        for c in inv
-    }
-
-
-def detect_trades(
-    old: Dict[str, Dict[str, Any]], new: Dict[str, Dict[str, Any]]
-) -> Tuple[List[Tuple[Dict[str, Any], Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Vergleicht zwei Inventar-Stände. Karte weg + Karte gleicher Seltenheit dazu = Tausch.
-    Gibt (Tausch-Paare (abgegeben, erhalten), nur erhalten, nur abgegeben) zurück."""
-    gained: List[Dict[str, Any]] = []
-    lost: List[Dict[str, Any]] = []
-    for cid in set(old) | set(new):
-        o, n = old.get(cid), new.get(cid)
-        oc = o["count"] if o else 0
-        nc = n["count"] if n else 0
-        if nc > oc and n:
-            gained += [n] * min(nc - oc, 20)
-        elif nc < oc and o:
-            lost += [o] * min(oc - nc, 20)
-    key = lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("deck", ""), c["name"])  # noqa: E731
-    gained.sort(key=key)
-    lost.sort(key=key)
-    lost_by: Dict[str, List[Dict[str, Any]]] = {}
-    for c in lost:
-        lost_by.setdefault(c["rarity"], []).append(c)
-    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    gained_left: List[Dict[str, Any]] = []
-    for g in gained:
-        pool = lost_by.get(g["rarity"])
-        if pool:
-            pairs.append((pool.pop(0), g))
-        else:
-            gained_left.append(g)
-    lost_left = [c for lst in lost_by.values() for c in lst]
-    return pairs, gained_left, lost_left
-
-
-def compute_tradeable(
-    my_inv: List[Dict[str, Any]],
-    partner_invs: Dict[str, Tuple[str, List[Dict[str, Any]]]],
-    only_tradeable: bool = True,
-) -> Dict[str, Dict[str, Any]]:
-    """Fehlende Karten (bei mir 0×), die mindestens ein Partner doppelt hat – bei only_tradeable zusätzlich nur,
-    wenn dieser Partner eine meiner Dubletten gleicher Seltenheit braucht (gleiche Logik wie die Kartensuche)."""
-    catalog = build_card_catalog([my_inv] + [inv for _, inv in partner_invs.values()])
-    my_counts = {c["id"]: c["count"] for c in my_inv}
-    my_dups: Dict[str, List[str]] = {}
-    for c in my_inv:
-        if c["count"] > 1:
-            my_dups.setdefault(c["rarity"], []).append(c["id"])
-    p_counts = [(label, {c["id"]: c["count"] for c in inv}) for label, inv in partner_invs.values()]
-    out: Dict[str, Dict[str, Any]] = {}
-    for cid, card in catalog.items():
-        if my_counts.get(cid, 0) > 0:
-            continue
-        counter_ids = [d for d in my_dups.get(card["rarity"], []) if d != cid]
-        partners: List[Dict[str, Any]] = []
-        for label, counts in p_counts:
-            n = counts.get(cid, 0)
-            if n < 2:
-                continue
-            usable = [d for d in counter_ids if counts.get(d, 0) == 0]
-            if usable or not only_tradeable:
-                partners.append({"label": label, "count": n, "counters": len(usable)})
-        if partners:
-            out[cid] = {"card": card, "partners": partners}
-    return out
-
-
-def check_profile(url: str, label: str, name_map: Dict[str, str], webhook: str) -> str:
-    """Lädt Profil + Partner, vergleicht mit dem letzten Stand und meldet Änderungen an Discord.
-    Erster Lauf = nur Ausgangsstand merken. Gibt eine kurze Statusmeldung zurück."""
-    with _CHECK_LOCK:
-        my_norm = normalize_url(url)
-        partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
-        pool = load_search_pool(url, label, partners)
-        layer = pick_search_layer(pool)
-        if layer is None or not pool["me"].get(layer):
-            raise RuntimeError("Profildaten konnten nicht ausgewertet werden")
-        my_inv = pool["me"][layer]
-        partner_invs = {u: (p["label"], p["layers"][layer]) for u, p in pool["partners"].items() if layer in p["layers"]}
-        new_inv = snapshot_inventory(my_inv)
-        tradeable = compute_tradeable(my_inv, partner_invs, NOTIFY_ONLY_TRADEABLE)
-
-        states = _load_json(STATE_FILE, {})
-        if not isinstance(states, dict):
-            states = {}
-        old = states.get(my_norm)
-        new_state = {"layer": layer, "inv": new_inv, "avail": sorted(tradeable),
-                     "checked": datetime.now().isoformat(timespec="seconds")}
-
-        # Ausgangsstand (erster Lauf) oder Auswerte-Schicht gewechselt -> nur merken, nichts melden
-        if not old or old.get("layer") != layer:
-            _save_json(STATE_FILE, {**states, my_norm: new_state})
-            if not old and webhook:
-                send_discord(webhook, f"👀 **{label}**: Überwachung gestartet – aktuell {len(tradeable)} "
-                                      f"Karte(n) tauschbar.")
-            return "Ausgangsstand gespeichert"
-        # Plausibilitätscheck: Seite halb leer geladen -> Stand NICHT überschreiben
-        if len(new_inv) < 0.5 * len(old["inv"]):
-            return "Profil unvollständig gelesen – übersprungen"
-
-        lines: List[str] = []
-        pairs, gained_left, lost_left = detect_trades(old["inv"], new_inv)
-        for gave, got in pairs:
-            lines.append(f"🔄 **{label}**: Karte {_card_desc(gave)} wurde mit Karte {_card_desc(got)} "
-                         f"erfolgreich getauscht ✅")
-        for c in gained_left:
-            lines.append(f"🎁 **{label}**: Neue Karte erhalten – {_card_desc(c)}")
-        for c in lost_left:
-            lines.append(f"📤 **{label}**: Karte abgegeben – {_card_desc(c)}")
-
-        known = set(old.get("avail", []))
-        for cid, info in tradeable.items():
-            if cid in known:
-                continue
-            who = ", ".join(
-                f"{p['label']} ({p['count']}×" + (f", {p['counters']} passende Gegenkarte(n)" if p["counters"] else "") + ")"
-                for p in info["partners"][:5]
-            )
-            lines.append(f"🃏 **{label}**: Neue Karte zum Tauschen – {_card_desc(info['card'])} → bei {who}")
-
-        if lines and webhook and not send_discord(webhook, "\n".join(lines)):
-            return "Discord-Versand fehlgeschlagen – wird beim nächsten Lauf erneut versucht"
-        _save_json(STATE_FILE, {**states, my_norm: new_state})
-        return f"{len(lines)} Meldung(en) gesendet" if lines else "Keine Änderungen"
-
-
-def _watch_loop(interval: int) -> None:
-    """Hintergrund-Wächter: läuft im Server-Prozess, auch wenn keine Seite offen ist."""
-    while True:
-        try:
-            watch = _load_json(WATCH_FILE, {})
-            webhook = get_discord_webhook()  # jedes Mal neu lesen: Änderungen im Admin-Bereich gelten sofort
-            if isinstance(watch, dict) and watch and webhook:
-                nm = load_name_map()
-                for url, label in list(watch.items()):
-                    try:
-                        check_profile(url, label, nm, webhook)
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[dropdex-watch] {label}: {e}", flush=True)
-                    time.sleep(1)
-        except Exception as e:  # noqa: BLE001
-            print(f"[dropdex-watch] Fehler: {e}", flush=True)
-        time.sleep(interval)
-
-
-@st.cache_resource(show_spinner=False)
-def start_watcher(interval: int) -> threading.Thread:
-    """Startet den Wächter genau einmal pro Server-Prozess."""
-    t = threading.Thread(target=_watch_loop, args=(interval,), daemon=True, name="dropdex-watch")
-    t.start()
-    return t
-
-
-def _uid(url: str) -> str:
-    return url.strip().rstrip("/").split("/")[-1]
-
-
-def pinned_profile_url(name_map: Dict[str, str]) -> str:
-    """Festes Profil aus dem Link (?me=<ID>) – so bleibt dein Name per Lesezeichen dauerhaft eingetragen."""
-    try:
-        uid = str(st.query_params.get("me", "")).strip()
-    except Exception:  # noqa: BLE001
-        return ""
-    if not uid:
-        return ""
-    return next((u for u in name_map if _uid(u) == uid), "")
-
-
-def render_me_controls(my_url: str, my_name: str, name_map: Dict[str, str]) -> None:
-    """Festlegen als eigenes Profil + Discord-Überwachung ein/aus + Test-Nachricht."""
-    if not my_url.strip() or normalize_url(my_url) not in {normalize_url(u) for u in name_map}:
-        return
-    url = normalize_url(my_url)
-    uid = _uid(url)
-    c1, c2 = st.columns(2)
-    with c1:
-        pinned = st.query_params.get("me", "")
-        if pinned == uid:
-            st.caption("📌 Fest als dein Profil eingetragen. Setze ein Lesezeichen auf diese Seite – "
-                       "dann öffnet sie sich immer mit deinem Namen.")
-        elif st.button("📌 Als mein Profil festlegen", key="pin_me"):
-            st.query_params["me"] = uid
-            st.rerun()
-        if pinned:
-            if st.button("🔓 Festes Profil lösen", key="unpin_me"):
-                st.query_params.pop("me", None)
-                st.session_state.pop("search_auto_tried", None)
-                st.rerun()
-    with c2:
-        webhook = get_discord_webhook()
-        if not webhook:
-            st.caption("🔔 Discord-Meldungen aus: Webhook fehlt – im Bereich „🔐 Admin · Profile verwalten“ eintragen.")
-            return
-        watch = _load_json(WATCH_FILE, {})
-        watch = watch if isinstance(watch, dict) else {}
-        want = st.checkbox("🔔 Discord-Benachrichtigungen für mich", value=url in watch, key=f"watch_{uid}")
-        if want and url not in watch:
-            watch[url] = my_name or name_map.get(url, "Ich")
-            _save_json(WATCH_FILE, watch)
-            with st.spinner("Lese Ausgangsstand …"):
-                try:
-                    check_profile(url, watch[url], load_name_map(), webhook)
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Erster Abruf fehlgeschlagen: {e}")
-        elif not want and url in watch:
-            watch.pop(url, None)
-            _save_json(WATCH_FILE, watch)
-        if want and st.button("📨 Test-Nachricht senden", key=f"discord_test_{uid}"):
-            ok = send_discord(webhook, f"✅ Test von der Dropdex-Tauschbörse ({my_name or 'Profil'}).")
-            st.success("Gesendet!") if ok else st.error("Senden fehlgeschlagen – Webhook prüfen.")
-
-
-def render_search_section(
-    name_map: Dict[str, str], selected_rarities: List[str], auto_on: bool = False, interval_min: int = 5
-) -> None:
-    """Oben auf der Seite: eigenes Profil laden -> alle fehlenden Karten -> Karte wählen -> Tauschpartner.
-    Läuft als Fragment: bei aktiver Auto-Aktualisierung lädt es sich selbst im eingestellten Intervall neu."""
-    name_map = load_name_map()  # Fragment-Läufe bekommen sonst die alten Argumente
-    default_me = pinned_profile_url(name_map)
+def render_search_section(name_map: Dict[str, str], selected_rarities: List[str]) -> None:
+    """Oben auf der Seite: eigenes Profil laden -> alle fehlenden Karten -> Karte wählen -> Tauschpartner."""
     st.markdown('<div class="section-title">🔍 Kartensuche & Tauschpartner</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    my_url, my_name = profile_picker("Mein Profil", "me", name_map, default_url=default_me)
+    my_url, my_name = profile_picker("Mein Profil", "me", name_map)
     my_norm = normalize_url(my_url) if my_url.strip() else ""
     partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
     st.markdown(
@@ -3794,30 +3385,7 @@ def render_search_section(
     )
     load_clicked = st.button("📥 Meine fehlenden Karten laden", type="primary", key="search_load",
                              disabled=not my_url.strip())
-    render_me_controls(my_url, my_name, name_map)
     st.markdown('</div>', unsafe_allow_html=True)
-
-    # ---- Automatisch (nach)laden: beim ersten Öffnen mit festem Profil und danach im Intervall ----
-    pool0 = st.session_state.get("search_pool")
-    if auto_on and not load_clicked:
-        stale = bool(pool0) and time.time() - pool0.get("loaded_at", 0) >= interval_min * 60 - 5
-        first = (not pool0) and bool(default_me) and bool(my_url.strip()) \
-            and not st.session_state.get("search_auto_tried")
-        if stale or first:
-            st.session_state["search_auto_tried"] = True
-            t_url = (pool0.get("me_url") or my_url) if stale else my_url
-            t_name = pool0["me_label"] if stale else my_name
-            t_norm = normalize_url(t_url)
-            t_partners = {u: n for u, n in name_map.items() if normalize_url(u) != t_norm}
-            try:
-                fresh = load_search_pool(t_url, t_name, t_partners)
-                fresh["me_url"] = t_norm
-                if fresh["me"]:
-                    st.session_state["search_pool"] = fresh
-            except Exception as e:  # noqa: BLE001
-                st.warning(f"Automatische Aktualisierung fehlgeschlagen: {e}")
-                if pool0:
-                    pool0["loaded_at"] = time.time()  # nicht bei jedem Rerun neu versuchen
 
     if load_clicked:
         bar = st.progress(0.0, text="Lade Profile …")
@@ -3833,7 +3401,6 @@ def render_search_section(
             st.session_state.pop("search_pool", None)
             st.error("In deinem Profil wurden keine Kartendaten gefunden.")
             return
-        pool["me_url"] = my_norm
         st.session_state["search_pool"] = pool
 
     pool = st.session_state.get("search_pool")
@@ -3847,11 +3414,6 @@ def render_search_section(
         st.error("Die Profildaten konnten nicht ausgewertet werden.")
         return
     me_label = pool["me_label"]
-    if pool.get("loaded_at"):
-        st.caption(
-            f"🕒 Stand: {datetime.fromtimestamp(pool['loaded_at']).strftime('%H:%M:%S')}"
-            + (f" · aktualisiert sich automatisch alle {interval_min} Min." if auto_on else " · Auto-Aktualisierung aus")
-        )
     my_inv = pool["me"][layer]
     partner_invs = {u: (p["label"], p["layers"][layer]) for u, p in pool["partners"].items() if layer in p["layers"]}
     not_loaded = [p["label"] for p in pool["partners"].values() if layer not in p["layers"]]
@@ -4023,7 +3585,7 @@ def stat_card(label: str, value: str, extra: str = "") -> str:
     )
 
 
-def profile_picker(label: str, slot: str, name_map: Dict[str, str], default_url: str = "") -> Tuple[str, str]:
+def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str, str]:
     """Profil-Auswahl per Panel: gespeicherte Profile per Dropdown wählen oder ein neues per
     URL + Name anlegen und dauerhaft speichern (dropdex_namen.json)."""
     st.markdown(f'<div class="panel-label">👤 {html_lib.escape(label)}</div>', unsafe_allow_html=True)
@@ -4031,11 +3593,6 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str], default_url:
     saved = sorted(name_map.items(), key=lambda kv: kv[1].lower())  # [(url, name), ...]
     new_entry_label = "➕ Neues Profil hinzufügen …"
     options = [new_entry_label] + [f"{name}  ·  {url}" for url, name in saved]
-    if default_url and f"picker_{slot}" not in st.session_state:
-        for _u, _n in saved:
-            if normalize_url(_u) == normalize_url(default_url):
-                st.session_state[f"picker_{slot}"] = f"{_n}  ·  {_u}"
-                break
     choice = st.selectbox(
         "Gespeichertes Profil", options, key=f"picker_{slot}", label_visibility="collapsed",
     )
@@ -4236,8 +3793,6 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
             for e in msg.get("errors", []):
                 st.warning(e)
 
-        render_webhook_admin()
-
         st.markdown("**Profile hinzufügen** – pro Zeile ein Profil: Name und URL (oder nur die User-ID). "
                     "Gleiche URL = Name wird aktualisiert.")
         st.text_area(
@@ -4324,14 +3879,6 @@ def main() -> None:
             "Seltenheiten filtern", options=rarity_options, default=rarity_options,
             format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
         )
-        ac1, ac2 = st.columns([2, 1])
-        with ac1:
-            auto_on = st.checkbox("🔄 Seite aktualisiert sich automatisch", value=True, key="auto_on")
-        with ac2:
-            interval_min = st.selectbox(
-                "Intervall", [1, 2, 5, 10, 15], index=2, key="auto_interval", disabled=not auto_on,
-                format_func=lambda m: f"alle {m} Min.", label_visibility="collapsed",
-            )
         with st.expander("ℹ️ Funktionsweise"):
             st.markdown(
                 "1. Profil auswählen oder neu speichern (URL + Name).\n"
@@ -4348,18 +3895,11 @@ def main() -> None:
 
     name_map = load_name_map()
 
-    # ---- Hintergrund-Wächter für Discord (tut nichts, solange kein Webhook/keine Überwachung aktiv ist) ----
-    start_watcher(WATCH_INTERVAL_S)
-
     # ---- Admin: Profile (Name + URL) verwalten ----
     render_admin_panel(name_map)
 
-    # ---- Kartensuche & Tauschpartner (ganz oben, lädt sich selbst neu) ----
-    if hasattr(st, "fragment"):
-        st.fragment(run_every=(interval_min * 60 if auto_on else None))(render_search_section)(
-            name_map, selected_rarities, auto_on, interval_min)
-    else:  # sehr alte Streamlit-Version: ohne Auto-Refresh
-        render_search_section(name_map, selected_rarities, False, interval_min)
+    # ---- Kartensuche & Tauschpartner (ganz oben) ----
+    render_search_section(name_map, selected_rarities)
     st.divider()
 
     # ---- Profile: gespeichert wählen oder neu anlegen ----
@@ -4367,7 +3907,7 @@ def main() -> None:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        url_p1, name_p1 = profile_picker("Spieler 1", "p1", name_map, default_url=pinned_profile_url(name_map))
+        url_p1, name_p1 = profile_picker("Spieler 1", "p1", name_map)
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
