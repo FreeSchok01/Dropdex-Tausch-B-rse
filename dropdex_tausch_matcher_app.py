@@ -3481,7 +3481,10 @@ def render_webhook_admin() -> None:
     st.markdown("**🔔 Discord-Webhook**")
     msg = st.session_state.pop("webhook_msg", None)
     if msg:
-        (st.success if msg[0] == "success" else st.error)(msg[1])
+        if msg[0] == "success":
+            st.success(msg[1])
+        else:
+            st.error(msg[1])
     cur = get_discord_webhook()
     saved_here = bool(_load_json(SETTINGS_FILE, {}).get("discord_webhook"))
     if cur:
@@ -3495,8 +3498,10 @@ def render_webhook_admin() -> None:
         st.button("💾 Webhook speichern", key="admin_wh_save", on_click=_admin_save_webhook)
     with w2:
         if st.button("📨 Test senden", key="admin_wh_test", disabled=not cur):
-            st.success("Gesendet!") if send_discord(cur, "✅ Test von der Dropdex-Tauschbörse.") \
-                else st.error("Senden fehlgeschlagen – Webhook prüfen.")
+            if send_discord(cur, "✅ Test von der Dropdex-Tauschbörse."):
+                st.success("Gesendet!")
+            else:
+                st.error("Senden fehlgeschlagen – Webhook prüfen.")
     with w3:
         st.button("🗑️ Webhook entfernen", key="admin_wh_del", on_click=_admin_delete_webhook, disabled=not saved_here)
     st.divider()
@@ -3792,7 +3797,10 @@ def render_discord_box(url: str, uid: str, label: str) -> None:
     st.markdown("**🔔 Discord-Benachrichtigungen**")
     msg = st.session_state.pop("me_wh_msg", None)
     if msg:
-        (st.success if msg[0] == "success" else st.error)(msg[1])
+        if msg[0] == "success":
+            st.success(msg[1])
+        else:
+            st.error(msg[1])
     default_wh = get_discord_webhook()
     entry = _watch_load().get(url)
     if entry is not None:
@@ -3809,8 +3817,10 @@ def render_discord_box(url: str, uid: str, label: str) -> None:
         b1, b2 = st.columns(2)
         with b1:
             if st.button("📨 Test senden", key=f"discord_test_{uid}", disabled=not eff):
-                st.success("Gesendet!") if send_discord(eff, f"✅ Test von der Dropdex-Tauschbörse ({lbl or label}).") \
-                    else st.error("Senden fehlgeschlagen – Webhook prüfen.")
+                if send_discord(eff, f"✅ Test von der Dropdex-Tauschbörse ({lbl or label})."):
+                    st.success("Gesendet!")
+                else:
+                    st.error("Senden fehlgeschlagen – Webhook prüfen.")
         with b2:
             st.button("🔕 Ausschalten", key=f"discord_off_{uid}", on_click=_me_stop, args=(url,))
         return
