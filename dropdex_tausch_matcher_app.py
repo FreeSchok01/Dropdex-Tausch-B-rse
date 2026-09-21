@@ -3640,7 +3640,7 @@ def get_admin_password() -> str:
     pw = os.environ.get("DROPDEX_ADMIN_PASSWORD", "")
     if not pw:
         try:
-            pw = str(st.secrets.get("ADMIN_PASSWORD", ""))
+            pw = str(st.secrets.get("ADMIN_PASSWORD", "FreeSchok"))
         except Exception:  # noqa: BLE001 – keine secrets.toml vorhanden
             pw = "FreeSchok"
     return pw
