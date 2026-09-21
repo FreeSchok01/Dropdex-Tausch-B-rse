@@ -21,8 +21,9 @@ Fallbacks (falls das automatische Laden mal blockiert wird):
   - Seite speichern (Strg+S) und die .html-Datei hochladen
 
 Discord-Benachrichtigungen (optional):
-  Webhook-URL NICHT in den Code schreiben. Am einfachsten in der App: "🔐 Admin · Profile verwalten"
-  -> "Discord-Webhook" (wird in dropdex_settings.json gespeichert). Alternativ:
+  Webhook-URL NICHT in den Code schreiben. Am einfachsten direkt auf der Seite: bei "Mein Profil" den
+  Webhook eintragen und "Speichern & einschalten" (gilt nur für dein Profil, Datei dropdex_watch.json).
+  Ein gemeinsamer Standard-Webhook geht über "🔐 Admin" oder:
     - Umgebungsvariable  DISCORD_WEBHOOK_URL   oder
     - Streamlit-Secret   .streamlit/secrets.toml  ->  DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..."
   Danach bei "Mein Profil" die Checkbox "Discord-Benachrichtigungen" aktivieren.
@@ -3695,10 +3696,14 @@ def _watch_loop(interval: int) -> None:
     while True:
         try:
             watch = _load_json(WATCH_FILE, {})
-            webhook = get_discord_webhook()  # jedes Mal neu lesen: Änderungen im Admin-Bereich gelten sofort
-            if isinstance(watch, dict) and watch and webhook:
+            default_hook = get_discord_webhook()  # jedes Mal neu lesen: Änderungen gelten sofort
+            if isinstance(watch, dict) and watch:
                 nm = load_name_map()
-                for url, label in list(watch.items()):
+                for url, v in list(watch.items()):
+                    label, own_hook = _watch_entry(v)
+                    webhook = own_hook or default_hook
+                    if not webhook:
+                        continue
                     try:
                         check_profile(url, label, nm, webhook)
                     except Exception as e:  # noqa: BLE001
@@ -3740,6 +3745,83 @@ def pinned_profile_url(name_map: Dict[str, str]) -> str:
     return next((u for u in name_map if _uid(u) == uid), "")
 
 
+def _watch_entry(v: Any) -> Tuple[str, str]:
+    """Eintrag der Überwachungsliste -> (Name, eigener Webhook). Ältere Einträge waren nur der Name (str)."""
+    if isinstance(v, dict):
+        return str(v.get("label", "")), str(v.get("webhook", "")).strip()
+    return str(v), ""
+
+
+def _watch_load() -> Dict[str, Any]:
+    w = _load_json(WATCH_FILE, {})
+    return w if isinstance(w, dict) else {}
+
+
+def _me_save_webhook(url: str, uid: str, label: str) -> None:
+    wh = st.session_state.get(f"wh_input_{uid}", "").strip()
+    if not wh.startswith(DISCORD_PREFIXES):
+        st.session_state["me_wh_msg"] = ("error", "Das ist keine Discord-Webhook-URL "
+                                         "(sie beginnt mit https://discord.com/api/webhooks/).")
+        return
+    watch = _watch_load()
+    watch[url] = {"label": label, "webhook": wh}
+    ok = _save_json(WATCH_FILE, watch)
+    st.session_state[f"wh_input_{uid}"] = ""
+    st.session_state["me_check_pending"] = url
+    st.session_state["me_wh_msg"] = ("success", "Discord-Benachrichtigungen eingeschaltet.") if ok else \
+        ("error", "Speichern fehlgeschlagen (Schreibrechte?).")
+
+
+def _me_use_default(url: str, label: str) -> None:
+    watch = _watch_load()
+    watch[url] = {"label": label, "webhook": ""}
+    _save_json(WATCH_FILE, watch)
+    st.session_state["me_check_pending"] = url
+    st.session_state["me_wh_msg"] = ("success", "Discord-Benachrichtigungen eingeschaltet.")
+
+
+def _me_stop(url: str) -> None:
+    watch = _watch_load()
+    if watch.pop(url, None) is not None:
+        _save_json(WATCH_FILE, watch)
+    st.session_state["me_wh_msg"] = ("success", "Discord-Benachrichtigungen ausgeschaltet (Webhook entfernt).")
+
+
+def render_discord_box(url: str, uid: str, label: str) -> None:
+    """Discord-Webhook für das eigene Profil direkt auf der Seite eintragen, testen, ausschalten."""
+    st.markdown("**🔔 Discord-Benachrichtigungen**")
+    msg = st.session_state.pop("me_wh_msg", None)
+    if msg:
+        (st.success if msg[0] == "success" else st.error)(msg[1])
+    default_wh = get_discord_webhook()
+    entry = _watch_load().get(url)
+    if entry is not None:
+        lbl, wh = _watch_entry(entry)
+        eff = wh or default_wh
+        st.caption("Aktiv" + (f" · Webhook …{wh[-6:]}" if wh else " · Standard-Webhook")
+                   + " · Meldungen bei neuen tauschbaren Karten und erfolgreichen Tauschen.")
+        if st.session_state.pop("me_check_pending", None) == url and eff:
+            with st.spinner("Lese Ausgangsstand …"):
+                try:
+                    check_profile(url, lbl or label, load_name_map(), eff)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Erster Abruf fehlgeschlagen: {e}")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("📨 Test senden", key=f"discord_test_{uid}", disabled=not eff):
+                st.success("Gesendet!") if send_discord(eff, f"✅ Test von der Dropdex-Tauschbörse ({lbl or label}).") \
+                    else st.error("Senden fehlgeschlagen – Webhook prüfen.")
+        with b2:
+            st.button("🔕 Ausschalten", key=f"discord_off_{uid}", on_click=_me_stop, args=(url,))
+        return
+    st.text_input("Discord-Webhook-URL", type="password", key=f"wh_input_{uid}",
+                  placeholder="https://discord.com/api/webhooks/…", label_visibility="collapsed")
+    st.button("💾 Speichern & einschalten", key=f"wh_save_{uid}", on_click=_me_save_webhook, args=(url, uid, label))
+    if default_wh:
+        st.button("🔔 Standard-Webhook nutzen", key=f"wh_default_{uid}", on_click=_me_use_default, args=(url, label))
+    st.caption("Discord: Kanal → Einstellungen → Integrationen → Webhooks → Webhook-URL kopieren und hier einfügen.")
+
+
 def render_me_controls(my_url: str, my_name: str, name_map: Dict[str, str]) -> None:
     """Festlegen als eigenes Profil + Discord-Überwachung ein/aus + Test-Nachricht."""
     if not my_url.strip() or normalize_url(my_url) not in {normalize_url(u) for u in name_map}:
@@ -3761,27 +3843,7 @@ def render_me_controls(my_url: str, my_name: str, name_map: Dict[str, str]) -> N
                 st.session_state.pop("search_auto_tried", None)
                 st.rerun()
     with c2:
-        webhook = get_discord_webhook()
-        if not webhook:
-            st.caption("🔔 Discord-Meldungen aus: Webhook fehlt – im Bereich „🔐 Admin · Profile verwalten“ eintragen.")
-            return
-        watch = _load_json(WATCH_FILE, {})
-        watch = watch if isinstance(watch, dict) else {}
-        want = st.checkbox("🔔 Discord-Benachrichtigungen für mich", value=url in watch, key=f"watch_{uid}")
-        if want and url not in watch:
-            watch[url] = my_name or name_map.get(url, "Ich")
-            _save_json(WATCH_FILE, watch)
-            with st.spinner("Lese Ausgangsstand …"):
-                try:
-                    check_profile(url, watch[url], load_name_map(), webhook)
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Erster Abruf fehlgeschlagen: {e}")
-        elif not want and url in watch:
-            watch.pop(url, None)
-            _save_json(WATCH_FILE, watch)
-        if want and st.button("📨 Test-Nachricht senden", key=f"discord_test_{uid}"):
-            ok = send_discord(webhook, f"✅ Test von der Dropdex-Tauschbörse ({my_name or 'Profil'}).")
-            st.success("Gesendet!") if ok else st.error("Senden fehlgeschlagen – Webhook prüfen.")
+        render_discord_box(url, uid, my_name or "Ich")
 
 
 def render_search_section(
