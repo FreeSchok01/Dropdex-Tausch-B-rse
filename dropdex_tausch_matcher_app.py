@@ -21,7 +21,8 @@ Fallbacks (falls das automatische Laden mal blockiert wird):
   - Seite speichern (Strg+S) und die .html-Datei hochladen
 
 Discord-Benachrichtigungen (optional):
-  Webhook-URL NICHT in den Code schreiben, sondern hinterlegen als
+  Webhook-URL NICHT in den Code schreiben. Am einfachsten in der App: "🔐 Admin · Profile verwalten"
+  -> "Discord-Webhook" (wird in dropdex_settings.json gespeichert). Alternativ:
     - Umgebungsvariable  DISCORD_WEBHOOK_URL   oder
     - Streamlit-Secret   .streamlit/secrets.toml  ->  DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..."
   Danach bei "Mein Profil" die Checkbox "Discord-Benachrichtigungen" aktivieren.
@@ -3401,6 +3402,8 @@ def search_partners(
 
 WATCH_FILE = "dropdex_watch.json"   # {Profil-URL: Name} – für diese Profile laufen die Discord-Meldungen
 STATE_FILE = "dropdex_state.json"   # letzter bekannter Stand je überwachtem Profil
+SETTINGS_FILE = "dropdex_settings.json"  # u. a. Discord-Webhook (im Admin-Bereich eingetragen)
+_SECRET_WEBHOOK = ""  # Zwischenspeicher für den Secrets-Wert (auch für den Hintergrund-Thread)
 WATCH_INTERVAL_S = max(60, int(os.environ.get("DROPDEX_WATCH_INTERVAL", "300") or 300))
 DISCORD_PREFIXES = ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")
 # True  = Meldung nur, wenn du die Karte wirklich 1:1 tauschen kannst (Partner hat sie doppelt UND braucht
@@ -3432,15 +3435,69 @@ def _save_json(path: str, data: Any) -> bool:
 
 
 def get_discord_webhook() -> str:
-    """Webhook-URL aus Umgebungsvariable DISCORD_WEBHOOK_URL oder Streamlit-Secret DISCORD_WEBHOOK_URL.
-    Bewusst NICHT im Code, damit sie nicht versehentlich mit veröffentlicht wird."""
-    url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    """Webhook-URL. Reihenfolge: im Admin-Bereich gespeichert (dropdex_settings.json) ->
+    Umgebungsvariable DISCORD_WEBHOOK_URL -> Streamlit-Secret DISCORD_WEBHOOK_URL."""
+    global _SECRET_WEBHOOK
+    settings = _load_json(SETTINGS_FILE, {})
+    url = str(settings.get("discord_webhook", "")).strip() if isinstance(settings, dict) else ""
+    if not url:
+        url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not url:
         try:
-            url = str(st.secrets.get("DISCORD_WEBHOOK_URL", "")).strip()
-        except Exception:  # noqa: BLE001 – keine secrets.toml vorhanden
-            url = ""
+            _SECRET_WEBHOOK = str(st.secrets.get("DISCORD_WEBHOOK_URL", "")).strip() or _SECRET_WEBHOOK
+        except Exception:  # noqa: BLE001 – keine secrets.toml / kein Streamlit-Kontext (Thread)
+            pass
+        url = _SECRET_WEBHOOK
     return url if url.startswith(DISCORD_PREFIXES) else ""
+
+
+def _admin_save_webhook() -> None:
+    url = st.session_state.get("admin_webhook", "").strip()
+    if not url.startswith(DISCORD_PREFIXES):
+        st.session_state["webhook_msg"] = ("error", "Das ist keine Discord-Webhook-URL "
+                                           "(sie beginnt mit https://discord.com/api/webhooks/).")
+        return
+    settings = _load_json(SETTINGS_FILE, {})
+    settings = settings if isinstance(settings, dict) else {}
+    settings["discord_webhook"] = url
+    ok = _save_json(SETTINGS_FILE, settings)
+    st.session_state["admin_webhook"] = ""
+    st.session_state["webhook_msg"] = ("success", "Webhook gespeichert.") if ok else \
+        ("error", "Speichern fehlgeschlagen (Schreibrechte?).")
+
+
+def _admin_delete_webhook() -> None:
+    settings = _load_json(SETTINGS_FILE, {})
+    if isinstance(settings, dict) and "discord_webhook" in settings:
+        settings.pop("discord_webhook")
+        _save_json(SETTINGS_FILE, settings)
+    st.session_state["webhook_msg"] = ("success", "Webhook entfernt.")
+
+
+def render_webhook_admin() -> None:
+    """Admin-Bereich: Discord-Webhook selbst eintragen, testen, entfernen."""
+    st.markdown("**🔔 Discord-Webhook**")
+    msg = st.session_state.pop("webhook_msg", None)
+    if msg:
+        (st.success if msg[0] == "success" else st.error)(msg[1])
+    cur = get_discord_webhook()
+    saved_here = bool(_load_json(SETTINGS_FILE, {}).get("discord_webhook"))
+    if cur:
+        st.caption(f"Aktiv: …{cur[-6:]} ({'hier gespeichert' if saved_here else 'aus Secrets/Umgebungsvariable'})")
+    else:
+        st.caption("Noch kein Webhook hinterlegt.")
+    st.text_input("Webhook-URL", type="password", key="admin_webhook",
+                  placeholder="https://discord.com/api/webhooks/…", label_visibility="collapsed")
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        st.button("💾 Webhook speichern", key="admin_wh_save", on_click=_admin_save_webhook)
+    with w2:
+        if st.button("📨 Test senden", key="admin_wh_test", disabled=not cur):
+            st.success("Gesendet!") if send_discord(cur, "✅ Test von der Dropdex-Tauschbörse.") \
+                else st.error("Senden fehlgeschlagen – Webhook prüfen.")
+    with w3:
+        st.button("🗑️ Webhook entfernen", key="admin_wh_del", on_click=_admin_delete_webhook, disabled=not saved_here)
+    st.divider()
 
 
 def _chunk_lines(lines: List[str], limit: int = 1900) -> List[str]:
@@ -3632,12 +3689,13 @@ def check_profile(url: str, label: str, name_map: Dict[str, str], webhook: str) 
         return f"{len(lines)} Meldung(en) gesendet" if lines else "Keine Änderungen"
 
 
-def _watch_loop(webhook: str, interval: int) -> None:
+def _watch_loop(interval: int) -> None:
     """Hintergrund-Wächter: läuft im Server-Prozess, auch wenn keine Seite offen ist."""
     while True:
         try:
             watch = _load_json(WATCH_FILE, {})
-            if isinstance(watch, dict) and watch:
+            webhook = get_discord_webhook()  # jedes Mal neu lesen: Änderungen im Admin-Bereich gelten sofort
+            if isinstance(watch, dict) and watch and webhook:
                 nm = load_name_map()
                 for url, label in list(watch.items()):
                     try:
@@ -3651,9 +3709,9 @@ def _watch_loop(webhook: str, interval: int) -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def start_watcher(webhook: str, interval: int) -> threading.Thread:
+def start_watcher(interval: int) -> threading.Thread:
     """Startet den Wächter genau einmal pro Server-Prozess."""
-    t = threading.Thread(target=_watch_loop, args=(webhook, interval), daemon=True, name="dropdex-watch")
+    t = threading.Thread(target=_watch_loop, args=(interval,), daemon=True, name="dropdex-watch")
     t.start()
     return t
 
@@ -3681,20 +3739,22 @@ def render_me_controls(my_url: str, my_name: str, name_map: Dict[str, str]) -> N
     uid = _uid(url)
     c1, c2 = st.columns(2)
     with c1:
-        if st.query_params.get("me", "") == uid:
+        pinned = st.query_params.get("me", "")
+        if pinned == uid:
             st.caption("📌 Fest als dein Profil eingetragen. Setze ein Lesezeichen auf diese Seite – "
                        "dann öffnet sie sich immer mit deinem Namen.")
-            if st.button("📌 Nicht mehr festhalten", key="unpin_me"):
-                st.query_params.pop("me", None)
-                st.session_state.pop("picker_me", None)
-                st.rerun()
         elif st.button("📌 Als mein Profil festlegen", key="pin_me"):
             st.query_params["me"] = uid
             st.rerun()
+        if pinned:
+            if st.button("🔓 Festes Profil lösen", key="unpin_me"):
+                st.query_params.pop("me", None)
+                st.session_state.pop("search_auto_tried", None)
+                st.rerun()
     with c2:
         webhook = get_discord_webhook()
         if not webhook:
-            st.caption("🔔 Discord-Meldungen aus: `DISCORD_WEBHOOK_URL` fehlt (siehe Hinweis oben im Code).")
+            st.caption("🔔 Discord-Meldungen aus: Webhook fehlt – im Bereich „🔐 Admin · Profile verwalten“ eintragen.")
             return
         watch = _load_json(WATCH_FILE, {})
         watch = watch if isinstance(watch, dict) else {}
@@ -4176,6 +4236,8 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
             for e in msg.get("errors", []):
                 st.warning(e)
 
+        render_webhook_admin()
+
         st.markdown("**Profile hinzufügen** – pro Zeile ein Profil: Name und URL (oder nur die User-ID). "
                     "Gleiche URL = Name wird aktualisiert.")
         st.text_area(
@@ -4286,10 +4348,8 @@ def main() -> None:
 
     name_map = load_name_map()
 
-    # ---- Hintergrund-Wächter für Discord (nur wenn ein Webhook hinterlegt ist) ----
-    webhook = get_discord_webhook()
-    if webhook:
-        start_watcher(webhook, WATCH_INTERVAL_S)
+    # ---- Hintergrund-Wächter für Discord (tut nichts, solange kein Webhook/keine Überwachung aktiv ist) ----
+    start_watcher(WATCH_INTERVAL_S)
 
     # ---- Admin: Profile (Name + URL) verwalten ----
     render_admin_panel(name_map)
