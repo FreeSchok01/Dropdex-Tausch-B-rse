@@ -23,8 +23,10 @@ Fallbacks (falls das automatische Laden mal blockiert wird):
 Benötigt:  pip install streamlit requests pandas
 """
 
+import hmac
 import html as html_lib
 import json
+import os
 import re
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
@@ -561,13 +563,17 @@ def load_name_map() -> Dict[str, str]:
         return dict(DEFAULT_PROFILES)
 
 
-def save_name_map(name_map: Dict[str, str]) -> None:
-    """Speichert die Zuordnung URL -> Name/@Handle dauerhaft in einer JSON-Datei."""
+def save_name_map(name_map: Dict[str, str]) -> bool:
+    """Speichert die Zuordnung URL -> Name/@Handle dauerhaft in einer JSON-Datei (atomar).
+    Gibt True zurück, wenn das Speichern geklappt hat."""
+    tmp = NAME_MAP_FILE + ".tmp"
     try:
-        with open(NAME_MAP_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(name_map, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, NAME_MAP_FILE)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def normalize_url(url_or_id: str) -> str:
@@ -2916,6 +2922,8 @@ CSS = """
     }
     .card-name { font-size: 0.82rem; font-weight: 600; text-align: center; max-width: 108px;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-streamer { font-size: 0.7rem; font-weight: 600; text-align: center; max-width: 108px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a78bfa; margin-top: -2px; }
     .trade-arrow { font-size: 1.4rem; color: #6c6f88; }
     .trade-meta { flex: 1; text-align: right; }
     .trade-owner { color: #b9bad0; font-size: 0.85rem; }
@@ -3012,10 +3020,19 @@ def _card_thumb_html(card: Optional[Dict[str, Any]], rarity: str, empty_hint: st
         if img_url else "🃏"
     )
     slot_tag = f'<span class="card-slot-tag">{slot}</span>' if slot else ""
+    streamer = str(card.get("streamer") or "").strip()
+    deck = str(card.get("deck") or "").strip()
+    streamer_html = ""
+    if streamer:
+        tip = f"{deck} von {streamer}" if deck else streamer
+        streamer_html = (
+            f'<div class="card-streamer" title="{html_lib.escape(tip)}">🎥 {html_lib.escape(streamer)}</div>'
+        )
     return (
         f'<div class="card-thumb{"" if img_url else " placeholder"}" style="--rc:{color};">'
         f'{inner}<span class="card-rarity-tag">{html_lib.escape(rarity)}</span>{slot_tag}</div>'
         f'<div class="card-name" title="{html_lib.escape(card["name"])}">{html_lib.escape(card["name"])}</div>'
+        f'{streamer_html}'
     )
 
 
@@ -3066,6 +3083,8 @@ SHARE_CSS = """
     }
     .card-name { font-size: 0.82rem; font-weight: 600; text-align: center; max-width: 108px;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-streamer { font-size: 0.7rem; font-weight: 600; text-align: center; max-width: 108px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a78bfa; margin-top: -2px; }
     .trade-arrow { font-size: 1.4rem; color: #6c6f88; }
     .trade-meta { flex: 1; text-align: right; min-width: 160px; }
     .trade-owner { color: #b9bad0; font-size: 0.85rem; }
@@ -3247,6 +3266,257 @@ def render_open_offers(items: List[Dict[str, Any]], owner_label: str, other_labe
         )
 
 
+SEARCH_LAYERS = ("PAGE", "RSC", "NEXT_DATA")
+
+
+def _trade_card_html(giver: str, receiver: str, give: Dict[str, Any], get: Dict[str, Any], rarity: str) -> str:
+    """Ein Tausch-Kärtchen: <giver> gibt `give`, <receiver> gibt `get` (Anzeige wie bei den direkten Treffern)."""
+    badge = RARITY_BADGE.get(rarity, "badge-common")
+    rarity_label = RARITY_LABEL_DE.get(rarity, rarity)
+    return (
+        f'<div class="trade-card">'
+        f'<div class="trade-side"><span class="trade-label">{html_lib.escape(giver.upper())} GIBT</span>'
+        f'{_card_thumb_html(give, rarity)}</div>'
+        f'<div class="trade-arrow">⇄</div>'
+        f'<div class="trade-side"><span class="trade-label">{html_lib.escape(receiver.upper())} GIBT</span>'
+        f'{_card_thumb_html(get, rarity)}</div>'
+        f'<div class="trade-meta"><span class="{badge}">{html_lib.escape(rarity_label)}</span><br/>'
+        f'<span class="trade-count">{html_lib.escape(receiver)} hat {get.get("offerer_count", 2)}× im Besitz</span>'
+        f'</div></div>'
+    )
+
+
+def load_profile_layers(url: str) -> Dict[str, List[Dict[str, Any]]]:
+    """Lädt EIN Profil und gibt je Auswerte-Schicht die gelesenen Karten zurück (leere Schichten entfallen)."""
+    raw = fetch_page(normalize_url(url))
+    if len(raw) < 500:
+        raise RuntimeError("Antwort fast leer – evtl. Bot-Schutz")
+    return {name: lay["cards"] for name, lay in build_layers(raw).items() if lay.get("cards")}
+
+
+def load_search_pool(me_url: str, me_label: str, partners: Dict[str, str], progress=None) -> Dict[str, Any]:
+    """Lädt das eigene Profil und alle gespeicherten Partner-Profile. Fehler bei einem Partner
+    brechen nichts ab (wird vermerkt); Fehler beim eigenen Profil wird weitergereicht."""
+    pool: Dict[str, Any] = {"me_label": me_label.strip() or "Ich", "me": {}, "partners": {}}
+    if progress:
+        progress(0.0, "Lade dein Profil …")
+    pool["me"] = load_profile_layers(me_url)
+    items = list(partners.items())
+    for i, (url, name) in enumerate(items):
+        if progress:
+            progress(i / max(len(items), 1), f"Lade Partner: {name} …")
+        try:
+            layers, err = load_profile_layers(url), ""
+        except Exception as e:  # noqa: BLE001
+            layers, err = {}, str(e)
+        pool["partners"][url] = {"label": name, "layers": layers, "error": err}
+    if progress:
+        progress(1.0, "Fertig")
+    return pool
+
+
+def pick_search_layer(pool: Dict[str, Any]) -> Optional[str]:
+    """Wählt die Auswerte-Schicht, die beim eigenen Profil und möglichst vielen Partnern Karten liefert
+    (nur dann sind die Karten-IDs untereinander vergleichbar)."""
+    best, best_n = None, -1
+    for name in SEARCH_LAYERS:
+        if name not in pool["me"]:
+            continue
+        n = sum(1 for p in pool["partners"].values() if name in p["layers"])
+        if n > best_n:
+            best, best_n = name, n
+    return best
+
+
+def build_card_catalog(inventories: List[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Fasst alle Profile zu einem Kartenkatalog zusammen. Fehlende Karten haben im eigenen Profil nur
+    „Karte 5“ und keine Seltenheit – Name, Seltenheit und Bild kommen hier von dem, der sie besitzt."""
+    cat: Dict[str, Dict[str, Any]] = {}
+    for inv in inventories:
+        for c in inv:
+            cur = cat.get(c["id"])
+            if cur is None:
+                cat[c["id"]] = {**c, "count": 0, "_known": c["count"] > 0}
+            elif c["count"] > 0 and not cur["_known"]:
+                cat[c["id"]] = {**c, "count": 0, "_known": True,
+                                "image_url": c.get("image_url") or cur.get("image_url")}
+            elif not cur.get("image_url") and c.get("image_url"):
+                cur["image_url"] = c["image_url"]
+    return cat
+
+
+def search_partners(
+    card: Dict[str, Any], my_inv: List[Dict[str, Any]], partner_invs: Dict[str, Tuple[str, List[Dict[str, Any]]]]
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Wer hat `card` als Dublette (>=2) und was kann ich ihm dagegen geben (meine Dubletten gleicher
+    Seltenheit, die ihm komplett fehlen)? Gibt (Partner mit Dublette, Namen mit nur 1x) zurück."""
+    cid, rarity = card["id"], card["rarity"]
+    my_dups = sorted(
+        (c for c in my_inv if c["count"] > 1 and c["rarity"] == rarity and c["id"] != cid),
+        key=lambda c: (c.get("deck", ""), c.get("slot", 0)),
+    )
+    partners: List[Dict[str, Any]] = []
+    singles: List[str] = []
+    for _url, (label, inv) in partner_invs.items():
+        counts = {c["id"]: c["count"] for c in inv}
+        n = counts.get(cid, 0)
+        if n >= 2:
+            partners.append({
+                "label": label, "count": n,
+                "counters": [{**c, "offerer_count": c["count"]} for c in my_dups if counts.get(c["id"], 0) == 0],
+            })
+        elif n == 1:
+            singles.append(label)
+    partners.sort(key=lambda p: (0 if p["counters"] else 1, -len(p["counters"]), p["label"].lower()))
+    return partners, singles
+
+
+def render_search_section(name_map: Dict[str, str], selected_rarities: List[str]) -> None:
+    """Oben auf der Seite: eigenes Profil laden -> alle fehlenden Karten -> Karte wählen -> Tauschpartner."""
+    st.markdown('<div class="section-title">🔍 Kartensuche & Tauschpartner</div>', unsafe_allow_html=True)
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    my_url, my_name = profile_picker("Mein Profil", "me", name_map)
+    my_norm = normalize_url(my_url) if my_url.strip() else ""
+    partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
+    st.markdown(
+        f'<div class="panel-hint">Als mögliche Tauschpartner dienen deine {len(partners)} anderen gespeicherten '
+        f'Profile (Spieler 1/2 unten kannst du ebenfalls dort speichern).</div>',
+        unsafe_allow_html=True,
+    )
+    load_clicked = st.button("📥 Meine fehlenden Karten laden", type="primary", key="search_load",
+                             disabled=not my_url.strip())
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if load_clicked:
+        bar = st.progress(0.0, text="Lade Profile …")
+        try:
+            pool = load_search_pool(my_url, my_name, partners, lambda f, t: bar.progress(min(f, 1.0), text=t))
+        except Exception as e:  # noqa: BLE001
+            bar.empty()
+            st.session_state.pop("search_pool", None)
+            st.error(f"Dein Profil konnte nicht geladen werden: {e}")
+            return
+        bar.empty()
+        if not pool["me"]:
+            st.session_state.pop("search_pool", None)
+            st.error("In deinem Profil wurden keine Kartendaten gefunden.")
+            return
+        st.session_state["search_pool"] = pool
+
+    pool = st.session_state.get("search_pool")
+    if not pool:
+        st.caption("Wähle dein Profil und lade es – dann siehst du alle Karten, die dir fehlen, und findest "
+                   "den passenden Tauschpartner.")
+        return
+
+    layer = pick_search_layer(pool)
+    if layer is None:
+        st.error("Die Profildaten konnten nicht ausgewertet werden.")
+        return
+    me_label = pool["me_label"]
+    my_inv = pool["me"][layer]
+    partner_invs = {u: (p["label"], p["layers"][layer]) for u, p in pool["partners"].items() if layer in p["layers"]}
+    not_loaded = [p["label"] for p in pool["partners"].values() if layer not in p["layers"]]
+    if not_loaded:
+        st.caption("⚠️ Nicht geladen / keine Daten: " + ", ".join(not_loaded))
+
+    catalog = build_card_catalog([my_inv] + [inv for _, inv in partner_invs.values()])
+    my_counts = {c["id"]: c["count"] for c in my_inv}
+    my_dups_by_rarity: Dict[str, List[str]] = {}
+    for c in my_inv:
+        if c["count"] > 1:
+            my_dups_by_rarity.setdefault(c["rarity"], []).append(c["id"])
+    partner_counts = [{c["id"]: c["count"] for c in inv} for _, inv in partner_invs.values()]
+
+    missing_all = [
+        c for cid, c in catalog.items()
+        if my_counts.get(cid, 0) == 0 and (c["rarity"] in selected_rarities or c["rarity"] == "UNKNOWN")
+    ]
+    # Nur Karten, die ich wirklich 1:1 tauschen kann: ein Partner hat sie doppelt UND braucht mindestens
+    # eine meiner Dubletten gleicher Seltenheit (ihm fehlt sie komplett).
+    trade_partners: Dict[str, int] = {}
+    for c in missing_all:
+        cid = c["id"]
+        my_dups = [d for d in my_dups_by_rarity.get(c["rarity"], []) if d != cid]
+        n = sum(1 for counts in partner_counts
+                if counts.get(cid, 0) >= 2 and any(counts.get(d, 0) == 0 for d in my_dups))
+        if n:
+            trade_partners[cid] = n
+    missing = [c for c in missing_all if c["id"] in trade_partners]
+    missing.sort(key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("deck", ""), c.get("slot", 0)))
+    st.markdown(
+        f"**{html_lib.escape(me_label)}** fehlen **{len(missing_all)}** Karten · davon kannst du "
+        f"**{len(missing)}** direkt 1:1 tauschen."
+    )
+
+    q = st.text_input("Fehlende Karten filtern", placeholder="Filtern nach Kartenname, Deck oder Streamer …",
+                      key="search_filter", label_visibility="collapsed")
+    tokens = [t for t in re.split(r"\s+", q.lower().strip()) if t]
+    shown = [c for c in missing
+             if all(t in f'{c["name"]} {c.get("deck", "")} {c.get("streamer", "")}'.lower() for t in tokens)]
+    if not shown:
+        if missing:
+            st.info("Keine tauschbare Karte passt zu deinem Filter.")
+        elif missing_all:
+            st.info("Aktuell ist keine deiner fehlenden Karten 1:1 tauschbar: Kein Partner hat sie doppelt und "
+                    "braucht gleichzeitig eine deiner Dubletten gleicher Seltenheit.")
+        else:
+            st.info("Dir fehlt keine Karte – stark! 🎉")
+        return
+
+    with st.expander(f"📋 Alle 1:1 tauschbaren Karten ({len(shown)})", expanded=False):
+        st.dataframe(pd.DataFrame([{
+            "Seltenheit": RARITY_LABEL_DE.get(c["rarity"], c["rarity"]),
+            "Karte": c["name"], "Deck": c.get("deck", ""), "Streamer": c.get("streamer", ""),
+            "Partner (1:1 möglich)": trade_partners[c["id"]],
+        } for c in shown]), hide_index=True)
+
+    by_id = {c["id"]: c for c in shown}
+
+    def _label(cid: Optional[str]) -> str:
+        if cid is None:
+            return "— Karte auswählen —"
+        c = by_id[cid]
+        extra = f" · 🎥 {c['streamer']}" if c.get("streamer") else ""
+        return f"🟢 {c['name']} · {RARITY_LABEL_DE.get(c['rarity'], c['rarity'])} · {c.get('deck', '')}{extra}"
+
+    pick = st.selectbox("Karte wählen", [None] + list(by_id), format_func=_label, key="search_pick",
+                        label_visibility="collapsed")
+    st.caption("Es werden nur Karten angezeigt, die du aktuell 1:1 gegen eine deiner Dubletten tauschen kannst.")
+    if pick is None:
+        return
+
+    card = by_id[pick]
+    rarity = card["rarity"]
+    rarity_label = RARITY_LABEL_DE.get(rarity, rarity)
+    badge = RARITY_BADGE.get(rarity, "badge-common")
+    sub = " · ".join(x for x in (
+        html_lib.escape(str(card.get("deck", ""))),
+        ("🎥 " + html_lib.escape(str(card["streamer"]))) if card.get("streamer") else "",
+    ) if x)
+    st.markdown(
+        f'<div class="section-title" style="margin-top:18px;">🃏 {html_lib.escape(card["name"])} '
+        f'<span class="{badge}">{html_lib.escape(rarity_label)}</span></div>'
+        f'<div class="panel-hint">{sub}</div>',
+        unsafe_allow_html=True,
+    )
+
+    matches, _singles = search_partners(card, my_inv, partner_invs)
+    matches = [m for m in matches if m["counters"]]
+    if not matches:
+        st.warning("Für diese Karte gibt es aktuell keinen Partner mit passendem 1:1-Tausch.")
+    for m in matches:
+        get = {**card, "offerer_count": m["count"]}
+        counters = m["counters"]
+        st.markdown(f"**✅ 👤 {html_lib.escape(m['label'])}** · hat die Karte {m['count']}× · "
+                    f"**{len(counters)}** passende Gegenkarte(n) von dir")
+        cards_html = [_trade_card_html(me_label, m["label"], c, get, rarity) for c in counters]
+        st.markdown("".join(cards_html[:3]), unsafe_allow_html=True)
+        if len(cards_html) > 3:
+            with st.expander(f"Weitere {len(cards_html) - 3} Tauschmöglichkeiten mit {m['label']}"):
+                st.markdown("".join(cards_html[3:]), unsafe_allow_html=True)
+
+
 def get_raw_input(label: str, url: str, pasted: str, uploaded) -> Tuple[str, bool, str]:
     """Priorität: Datei > eingefügter Text > URL. Gibt (rohtext, force_text, quelle) zurück."""
     if uploaded is not None:
@@ -3361,6 +3631,231 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str
     return url, name
 
 
+URL_IN_LINE_RE = re.compile(r"https?://\S+")
+PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+
+
+def get_admin_password() -> str:
+    """Admin-Passwort aus Umgebungsvariable DROPDEX_ADMIN_PASSWORD oder Streamlit-Secret ADMIN_PASSWORD."""
+    pw = os.environ.get("DROPDEX_ADMIN_PASSWORD", "")
+    if not pw:
+        try:
+            pw = str(st.secrets.get("ADMIN_PASSWORD", ""))
+        except Exception:  # noqa: BLE001 – keine secrets.toml vorhanden
+            pw = "FreeSchok"
+    return pw
+
+
+def parse_profile_lines(text: str) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Liest viele Profile auf einmal: pro Zeile Name und URL (oder nur die User-ID), Reihenfolge und
+    Trenner (| ; , Tab, Leerzeichen) egal. Gibt ([(normalisierte URL, Name)], [Fehlermeldungen]) zurück."""
+    entries: List[Tuple[str, str]] = []
+    errors: List[str] = []
+    for raw in text.replace("\r", "").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = URL_IN_LINE_RE.search(line)
+        if m:
+            url = m.group(0).rstrip(",;|")
+            rest = line[:m.start()] + " " + line[m.end():]
+            if "dropdex.de" not in url:
+                errors.append(f"Keine dropdex.de-URL: {line}")
+                continue
+        else:
+            tokens = [t for t in re.split(r"[\s|;,]+", line) if t]
+            ids = [t for t in tokens if PROFILE_ID_RE.match(t)]
+            if len(ids) != 1:
+                errors.append(f"Keine eindeutige URL/User-ID gefunden: {line}")
+                continue
+            url = ids[0]
+            rest = " ".join(t for t in tokens if t != url)
+        name = re.sub(r"\s+", " ", re.sub(r"^[\s|;,:\-–]+|[\s|;,:\-–]+$", "", rest)).strip()
+        if not name:
+            errors.append(f"Name fehlt: {line}")
+            continue
+        entries.append((normalize_url(url), name))
+    return entries, errors
+
+
+def _admin_add_profiles() -> None:
+    """Callback: fügt die Zeilen aus dem Textfeld hinzu (bestehende URL -> Name wird aktualisiert)."""
+    entries, errors = parse_profile_lines(st.session_state.get("admin_bulk", ""))
+    nm = load_name_map()
+    new = upd = 0
+    for url, name in entries:
+        if url not in nm:
+            new += 1
+        elif nm[url] != name:
+            upd += 1
+        nm[url] = name
+    ok = save_name_map(nm) if entries else True
+    st.session_state["admin_msg"] = {"new": new, "upd": upd, "errors": errors, "saved": ok, "n": len(entries)}
+    if entries and ok:
+        st.session_state["admin_bulk"] = ""
+
+
+def _admin_delete_profiles() -> None:
+    nm = load_name_map()
+    for url in st.session_state.get("admin_delete", []):
+        nm.pop(url, None)
+    ok = save_name_map(nm)
+    st.session_state["admin_msg"] = {"deleted": len(st.session_state.get("admin_delete", [])), "saved": ok,
+                                     "errors": []}
+    st.session_state["admin_delete"] = []
+
+
+def _admin_restore_backup() -> None:
+    up = st.session_state.get("admin_upload")
+    if up is None:
+        return
+    try:
+        data = json.loads(up.getvalue().decode("utf-8"))
+        if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+            raise ValueError("Erwartet ein JSON-Objekt {URL: Name}")
+    except Exception as e:  # noqa: BLE001
+        st.session_state["admin_msg"] = {"errors": [f"Backup nicht lesbar: {e}"], "saved": True}
+        return
+    nm = load_name_map()
+    before = len(nm)
+    nm.update({normalize_url(k): v for k, v in data.items()})
+    ok = save_name_map(nm)
+    st.session_state["admin_msg"] = {"new": len(nm) - before, "upd": 0, "errors": [], "saved": ok, "n": len(data)}
+
+
+ANCHOR_U_RE = re.compile(r'<a\b[^>]*?href="[^"]*?/u/([A-Za-z0-9_-]{20,})[^"]*"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+
+
+def extract_profile_links(raw_html: str) -> List[Tuple[str, str]]:
+    """Sucht in einer Profilseite alle Links auf andere Profile (/u/<ID>) und gibt [(Name, ID)] zurück.
+    Der Name ist der sichtbare Link-Text (bzw. Bild-Alt-Text); doppelte IDs werden zusammengefasst."""
+    found: Dict[str, str] = {}
+    for uid, inner in ANCHOR_U_RE.findall(raw_html):
+        alts = re.findall(r'alt="([^"]*)"', inner)
+        text = re.sub(r"<[^>]+>", " ", inner)
+        text = html_lib.unescape(re.sub(r"\s+", " ", text)).strip().lstrip("@")
+        if not text and alts:
+            text = html_lib.unescape(alts[0]).strip()
+        name = text[:40]
+        if uid not in found or (name and (not found[uid] or len(name) < len(found[uid]))):
+            found[uid] = name
+    return [(n, u) for u, n in found.items()]
+
+
+def _admin_append_scan() -> None:
+    """Callback: übernimmt die gefundenen Zeilen ins Admin-Textfeld (ohne bereits gespeicherte Profile)."""
+    known = {normalize_url(u) for u in load_name_map()}
+    lines = [f"{n or '???'}  {u}" for n, u in st.session_state.get("admin_scan_result", [])
+             if normalize_url(u) not in known]
+    cur = st.session_state.get("admin_bulk", "").rstrip()
+    st.session_state["admin_bulk"] = (cur + "\n" if cur else "") + "\n".join(lines)
+
+
+def render_admin_panel(name_map: Dict[str, str]) -> None:
+    """Admin-Bereich (passwortgeschützt): viele Profile (Name + URL) auf einmal hinzufügen, löschen,
+    sichern. Alles landet dauerhaft in dropdex_namen.json und steht danach überall als Auswahl/Partner bereit."""
+    with st.expander("🔐 Admin · Profile verwalten", expanded=False):
+        pw = get_admin_password()
+        if not pw:
+            st.info(
+                "Der Admin-Zugang ist noch nicht eingerichtet. Lege ein Passwort fest – lokal in der Datei "
+                "`.streamlit/secrets.toml` (oder als Umgebungsvariable `DROPDEX_ADMIN_PASSWORD`), auf "
+                "Streamlit Cloud unter *Settings → Secrets*:"
+            )
+            st.code('ADMIN_PASSWORD = "dein-passwort"', language="toml")
+            return
+        if not st.session_state.get("is_admin"):
+            entered = st.text_input("Admin-Passwort", type="password", key="admin_pw")
+            if st.button("Anmelden", key="admin_login"):
+                if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
+                    st.session_state["is_admin"] = True
+                    st.rerun()
+                else:
+                    st.error("Falsches Passwort.")
+            return
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(f"**{len(name_map)}** Profile gespeichert.")
+        with c2:
+            if st.button("Abmelden", key="admin_logout"):
+                st.session_state["is_admin"] = False
+                st.rerun()
+
+        msg = st.session_state.pop("admin_msg", None)
+        if msg:
+            if not msg.get("saved", True):
+                st.error("Speichern fehlgeschlagen (Schreibrechte?). Die Änderungen sind nur bis zum Neustart aktiv.")
+            elif "deleted" in msg:
+                st.success(f"{msg['deleted']} Profil(e) gelöscht.")
+            elif msg.get("n"):
+                st.success(f"{msg.get('new', 0)} neu hinzugefügt, {msg.get('upd', 0)} aktualisiert.")
+            for e in msg.get("errors", []):
+                st.warning(e)
+
+        st.markdown("**Profile hinzufügen** – pro Zeile ein Profil: Name und URL (oder nur die User-ID). "
+                    "Gleiche URL = Name wird aktualisiert.")
+        st.text_area(
+            "Profile", key="admin_bulk", height=170, label_visibility="collapsed",
+            placeholder="ETS2Chaoten | https://dropdex.de/de/u/cmt39st0b02xtigydjkep2cxl\n"
+                        "@AnderesProfil | cmt1o16wx001lx4ydnczju2ch",
+        )
+        entries, _ = parse_profile_lines(st.session_state.get("admin_bulk", ""))
+        st.button(f"➕ Hinzufügen / aktualisieren ({len(entries)} erkannt)", key="admin_add",
+                  type="primary", on_click=_admin_add_profiles, disabled=not st.session_state.get("admin_bulk", "").strip())
+
+        with st.expander("🔎 Profile aus einer Profilseite auslesen"):
+            st.caption("Liest alle Profil-Links (Streamer/Nutzer, die auf der Seite verlinkt sind) samt Name und "
+                       "User-ID aus einer Profilseite und gibt sie als „Name  ID“ aus.")
+            scan_url = st.text_input("Profil-URL", placeholder="https://dropdex.de/de/u/…", key="admin_scan_url")
+            if st.button("🔎 Auslesen", key="admin_scan_btn", disabled=not scan_url.strip()):
+                try:
+                    st.session_state["admin_scan_result"] = extract_profile_links(fetch_page(normalize_url(scan_url)))
+                except Exception as e:  # noqa: BLE001
+                    st.session_state["admin_scan_result"] = []
+                    st.error(f"Seite konnte nicht geladen werden: {e}")
+            found = st.session_state.get("admin_scan_result")
+            if found is not None and st.session_state.get("admin_scan_url", "").strip():
+                if not found:
+                    st.warning("Keine Profil-Links gefunden. Evtl. sind die Streamer dort nicht verlinkt – "
+                               "dann speichere die Seite (Strg+S) und schick mir die .html-Datei.")
+                else:
+                    st.code("\n".join(f"{n or '???'}  {u}" for n, u in found))
+                    st.button(f"⬆️ {len(found)} Einträge ins Feld oben übernehmen", key="admin_scan_take",
+                              on_click=_admin_append_scan)
+
+        if name_map:
+            st.markdown("**Gespeicherte Profile**")
+            st.dataframe(pd.DataFrame(
+                [{"Name": n, "URL": u} for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())]
+            ), hide_index=True)
+            st.multiselect(
+                "Profile löschen", options=sorted(name_map, key=lambda u: name_map[u].lower()),
+                format_func=lambda u: f"{name_map[u]}  ·  {u}", key="admin_delete",
+            )
+            st.button("🗑️ Ausgewählte löschen", key="admin_del_btn", on_click=_admin_delete_profiles,
+                      disabled=not st.session_state.get("admin_delete"))
+
+            with st.expander("💾 Backup & Export"):
+                st.caption(
+                    "Gespeichert wird in `dropdex_namen.json` neben der App. Bei Hostern mit flüchtigem Speicher "
+                    "(z. B. manche Cloud-Dienste) kann die Datei bei einem Neustart zurückgesetzt werden – dann die "
+                    "Code-Vorlage unten in `DEFAULT_PROFILES` einfügen oder das Backup wieder einspielen."
+                )
+                st.download_button("📥 Backup (JSON) herunterladen",
+                                   json.dumps(name_map, ensure_ascii=False, indent=2, sort_keys=True),
+                                   "dropdex_namen.json", "application/json", key="admin_dl")
+                st.file_uploader("Backup einspielen", type=["json"], key="admin_upload")
+                st.button("📤 Backup einspielen", key="admin_restore", on_click=_admin_restore_backup,
+                          disabled=st.session_state.get("admin_upload") is None)
+                st.markdown("Liste zum Kopieren (Name | URL):")
+                st.code("\n".join(f"{n} | {u}" for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())))
+                st.markdown("Code-Vorlage für `DEFAULT_PROFILES`:")
+                st.code("DEFAULT_PROFILES = {\n" + "".join(
+                    f"    {json.dumps(u)}: {json.dumps(n, ensure_ascii=False)},\n"
+                    for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
+
+
 def main() -> None:
     st.set_page_config(page_title="Tauschbörse · Dropdex Matcher", page_icon="🔄", layout="wide")
     st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
@@ -3391,11 +3886,21 @@ def main() -> None:
                 "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
                 "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
                 "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
-                "✨ Unterstützt auch die Seltenheit **Shiny**."
+                "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥).\n\n"
+                "🔍 **Kartensuche (ganz oben):** Eigenes Profil laden → alle fehlenden Karten ansehen → Karte wählen → "
+                "du bekommst die Partner (aus deinen gespeicherten Profilen), die sie doppelt haben, samt "
+                "passenden Gegenkarten von dir."
             )
         st.markdown('</div>', unsafe_allow_html=True)
 
     name_map = load_name_map()
+
+    # ---- Admin: Profile (Name + URL) verwalten ----
+    render_admin_panel(name_map)
+
+    # ---- Kartensuche & Tauschpartner (ganz oben) ----
+    render_search_section(name_map, selected_rarities)
+    st.divider()
 
     # ---- Profile: gespeichert wählen oder neu anlegen ----
     st.markdown('<div class="section-title">👥 Profile</div>', unsafe_allow_html=True)
