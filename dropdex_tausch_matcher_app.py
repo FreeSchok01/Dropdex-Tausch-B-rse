@@ -3404,6 +3404,28 @@ def render_my_progress(user: Dict[str, Any], my_inv: List[Dict[str, Any]]) -> No
     st.divider()
 
 
+def render_my_full_inventory(my_inv: List[Dict[str, Any]]) -> None:
+    """Zeigt alle Karten des eigenen Profils an (besessene + fehlende), nicht nur die
+    tauschbaren fehlenden – auf Wunsch als vollständige Übersicht im „Mein Profil“-Bereich."""
+    with st.expander(f"📋 Alle meine Karten ({len(my_inv)})", expanded=False):
+        q = st.text_input(
+            "Karten filtern", placeholder="Filtern nach Kartenname, Deck oder Streamer …",
+            key="myinv_filter", label_visibility="collapsed",
+        )
+        tokens = [t for t in re.split(r"\s+", q.lower().strip()) if t]
+        rows = [c for c in my_inv
+                if all(t in f'{c.get("name", "")} {c.get("deck", "")} {c.get("streamer", "")}'.lower()
+                       for t in tokens)]
+        rows = sorted(rows, key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("deck", ""), c.get("slot", 0)))
+        st.dataframe(pd.DataFrame([{
+            "Seltenheit": RARITY_LABEL_DE.get(c["rarity"], c["rarity"]),
+            "Karte": c.get("name", ""),
+            "Deck": c.get("deck", ""),
+            "Streamer": c.get("streamer", ""),
+            "Besitze": c["count"],
+        } for c in rows]), hide_index=True, use_container_width=True)
+
+
 def render_search_section(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
     """Oben auf der Seite: eigenes Profil laden -> alle fehlenden Karten -> Karte wählen -> Tauschpartner."""
     st.markdown('<div class="section-title">🔍 Kartensuche & Tauschpartner</div>', unsafe_allow_html=True)
@@ -3413,7 +3435,7 @@ def render_search_section(name_map: Dict[str, str], selected_rarities: List[str]
     partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
     st.markdown(
         f'<div class="panel-hint">Als mögliche Tauschpartner dienen deine {len(partners)} anderen gespeicherten '
-        f'Profile (Spieler 1/2 unten kannst du ebenfalls dort speichern).</div>',
+        f'Profile.</div>',
         unsafe_allow_html=True,
     )
     load_clicked = st.button("📥 Meine fehlenden Karten laden", type="primary", key="search_load",
@@ -3468,6 +3490,7 @@ def render_search_section(name_map: Dict[str, str], selected_rarities: List[str]
         st.caption("⚠️ Nicht geladen / keine Daten: " + ", ".join(not_loaded))
 
     render_my_progress(user, my_inv)
+    render_my_full_inventory(my_inv)
 
     catalog = build_card_catalog([my_inv] + [inv for _, inv in partner_invs.values()])
     my_counts = {c["id"]: c["count"] for c in my_inv}
@@ -3635,13 +3658,13 @@ def stat_card(label: str, value: str, extra: str = "") -> str:
 
 
 def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str, str]:
-    """Profil-Auswahl per Panel: gespeicherte Profile per Dropdown wählen oder ein neues per
-    URL + Name anlegen und dauerhaft speichern (dropdex_namen.json)."""
+    """Profil-Auswahl per Panel: gespeicherte Profile per Dropdown wählen (nur Name sichtbar,
+    keine URL) oder ein neues per URL + Name anlegen und dauerhaft speichern (dropdex_namen.json)."""
     st.markdown(f'<div class="panel-label">👤 {html_lib.escape(label)}</div>', unsafe_allow_html=True)
 
     saved = sorted(name_map.items(), key=lambda kv: kv[1].lower())  # [(url, name), ...]
     new_entry_label = "➕ Neues Profil hinzufügen …"
-    options = [new_entry_label] + [f"{name}  ·  {url}" for url, name in saved]
+    options = [new_entry_label] + [name for _, name in saved]
     choice = st.selectbox(
         "Gespeichertes Profil", options, key=f"picker_{slot}", label_visibility="collapsed",
     )
@@ -3672,7 +3695,7 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str
 
     idx = options.index(choice) - 1
     url, name = saved[idx]
-    st.markdown(f'<div class="panel-hint">🔗 {html_lib.escape(url)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="panel-hint">✅ Ausgewählt: {html_lib.escape(name)}</div>', unsafe_allow_html=True)
     # Hinweis: Das Entfernen aus dieser öffentlichen, gemeinsamen Profilliste ist bewusst nur
     # im Admin-Dashboard möglich (siehe _admin_delete_profiles) – nicht hier, da sonst jeder
     # eingeloggte Nutzer fremde, für alle sichtbare Profile löschen könnte.
@@ -3960,72 +3983,38 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
                     for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Tauschbörse · Dropdex Matcher", page_icon="🔄", layout="wide")
-    st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
+def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
+    """Bereich „🔄 1:1 Tausch“: Spieler 1 ist immer automatisch das eigene, hinterlegte Profil;
+    Spieler 2 wird aus der öffentlichen Profilliste gewählt (nur Name sichtbar)."""
+    own_url = (user.get("own_profile_url") or "").strip()
+    own_name = (user.get("own_profile_name") or "").strip()
 
-    st.markdown(
-        '<div class="hero">'
-        '<img class="hero-logo" src="https://i.ibb.co/fzYSQgkj/Free-Schok-Studio.png" alt="FreeSchok Studio Logo"/>'
-        '<h1>🔄 Tauschbörse</h1>'
-        '<p>Tausche deine <strong>doppelten</strong> Karten – immer gleiche Seltenheit gegen gleiche, '
-        'deckübergreifend. Vergleicht zwei Dropdex-Profile und stellt daraus direkt passende '
-        '1:1-Tauschgeschäfte zusammen.</p></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="section-title">👥 Profile</div>', unsafe_allow_html=True)
 
-    # ---- Twitch-Login-Gate: ohne Login bzw. bei Bann geht es hier nicht weiter ----
-    if not auth_ui.render_login_gate():
+    if not own_url:
+        st.info(
+            "Du hast noch kein eigenes Profil hinterlegt. Füge es zuerst im Bereich "
+            "„👤 Mein Profil“ hinzu – danach wird es hier automatisch als Spieler 1 genutzt."
+        )
         return
 
-    # ---- Admin-Dashboard (nur sichtbar für is_admin == True) ----
-    auth_ui.render_admin_dashboard()
-
-    # ---- Toolbar: Seltenheiten-Filter (oben, keine Sidebar) ----
-    with st.container():
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
-        rarity_options = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
-        selected_rarities = st.multiselect(
-            "Seltenheiten filtern", options=rarity_options, default=rarity_options,
-            format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
-        )
-        with st.expander("ℹ️ Funktionsweise"):
-            st.markdown(
-                "1. Profil auswählen oder neu speichern (URL + Name).\n"
-                "2. Beide Inventare werden aus dem Seiten-HTML gelesen (inkl. Kartenbilder, falls vorhanden).\n"
-                "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
-                "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
-                "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
-                "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥).\n\n"
-                "🔍 **Kartensuche (ganz oben):** Eigenes Profil laden → alle fehlenden Karten ansehen → Karte wählen → "
-                "du bekommst die Partner (aus deinen gespeicherten Profilen), die sie doppelt haben, samt "
-                "passenden Gegenkarten von dir."
-            )
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    name_map = load_name_map()
-
-    # ---- Admin: Profile (Name + URL) verwalten ----
-    render_admin_panel(name_map)
-
-    # ---- Kartensuche & Tauschpartner (ganz oben) ----
-    render_search_section(name_map, selected_rarities, st.session_state["auth_user"])
-    st.divider()
-
-    # ---- Profile: gespeichert wählen oder neu anlegen ----
-    st.markdown('<div class="section-title">👥 Profile</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        url_p1, name_p1 = profile_picker("Spieler 1", "p1", name_map)
+        st.markdown('<div class="panel-label">👤 Spieler 1</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="panel-hint">✅ {html_lib.escape(own_name or own_url)} (dein Profil)</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
         url_p2, name_p2 = profile_picker("Spieler 2", "p2", name_map)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    btn = st.button("🔄 Profile abgleichen", type="primary")
+    url_p1, name_p1 = own_url, (own_name or own_url)
+
+    btn = st.button("🔄 Profile abgleichen", type="primary", disabled=not url_p2.strip())
 
     if btn:
         with st.spinner("Lade und analysiere Dropdex-Profile..."):
@@ -4056,7 +4045,7 @@ def main() -> None:
 
     data = st.session_state.get("data")
     if not data:
-        st.info("Profile auswählen und auf „Profile abgleichen“ klicken.")
+        st.info("Spieler 2 auswählen und auf „Profile abgleichen“ klicken.")
         return
 
     p1_label = data.get("p1_label", "Spieler 1")
@@ -4110,6 +4099,71 @@ def main() -> None:
     st.download_button(
         f"📥 {share_fname} herunterladen", share_html, share_fname, "text/html", type="primary",
     )
+
+
+def render_admin_tab(name_map: Dict[str, str]) -> None:
+    """Bereich „🛠️ Admin“: Nutzerverwaltung (Sperren/Admin) + öffentliche Profilliste verwalten.
+    Wird in main() nur als Reiter angeboten, wenn der eingeloggte Nutzer Admin ist."""
+    auth_ui.render_admin_dashboard()
+    render_admin_panel(name_map)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Tauschbörse · Dropdex Matcher", page_icon="🔄", layout="wide")
+    st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="hero">'
+        '<img class="hero-logo" src="https://i.ibb.co/fzYSQgkj/Free-Schok-Studio.png" alt="FreeSchok Studio Logo"/>'
+        '<h1>🔄 Tauschbörse</h1>'
+        '<p>Tausche deine <strong>doppelten</strong> Karten – immer gleiche Seltenheit gegen gleiche, '
+        'deckübergreifend. Vergleicht zwei Dropdex-Profile und stellt daraus direkt passende '
+        '1:1-Tauschgeschäfte zusammen.</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ---- Twitch-Login-Gate: ohne Login bzw. bei Bann geht es hier nicht weiter ----
+    if not auth_ui.render_login_gate():
+        return
+
+    user = st.session_state["auth_user"]
+
+    # ---- Toolbar: Seltenheiten-Filter (oben, gilt für alle Bereiche) ----
+    with st.container():
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
+        rarity_options = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
+        selected_rarities = st.multiselect(
+            "Seltenheiten filtern", options=rarity_options, default=rarity_options,
+            format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
+        )
+        with st.expander("ℹ️ Funktionsweise"):
+            st.markdown(
+                "1. **👤 Mein Profil:** Eigenes Profil hinterlegen, fehlende Karten & Fortschritt ansehen.\n"
+                "2. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 und vergleiche.\n"
+                "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
+                "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
+                "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
+                "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥)."
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    name_map = load_name_map()
+
+    # ---- Navigation links (Sidebar) ----
+    nav_options = ["👤 Mein Profil", "🔄 1:1 Tausch"]
+    if user.get("is_admin"):
+        nav_options.append("🛠️ Admin")
+    with st.sidebar:
+        st.divider()
+        page = st.radio("📍 Bereich", nav_options, key="nav_page")
+
+    if page == "👤 Mein Profil":
+        render_search_section(name_map, selected_rarities, user)
+    elif page == "🔄 1:1 Tausch":
+        render_trade_tab(name_map, selected_rarities, user)
+    elif page == "🛠️ Admin":
+        render_admin_tab(name_map)
 
 
 if __name__ == "__main__":
