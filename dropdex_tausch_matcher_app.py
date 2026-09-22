@@ -3511,11 +3511,13 @@ def render_my_profile_page(user: Dict[str, Any]) -> None:
     st.markdown('<div class="section-title">👤 Mein Profil</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     my_url, my_name = my_profile_picker(user)
-    load_clicked = st.button("📥 Mein Profil laden", type="primary", key="myprofile_load",
-                             disabled=not my_url.strip())
+    refresh_clicked = st.button("🔄 Profil neu laden", key="myprofile_load", disabled=not my_url.strip())
     st.markdown('</div>', unsafe_allow_html=True)
 
-    if load_clicked:
+    # Direkt automatisch laden, sobald ein eigenes Profil hinterlegt ist – kein Klick nötig.
+    # Nur beim allerersten Rendern dieser Sitzung bzw. per "🔄 Neu laden"-Button erneut.
+    auto_load = bool(my_url.strip()) and "myprofile_inv" not in st.session_state
+    if refresh_clicked or auto_load:
         with st.spinner("Lade dein Dropdex-Profil …"):
             try:
                 my_inv = load_my_full_profile(my_url)
@@ -3538,8 +3540,8 @@ def render_my_profile_page(user: Dict[str, Any]) -> None:
 
     my_inv = st.session_state.get("myprofile_inv")
     if not my_inv:
-        st.caption("Wähle dein Profil und lade es – danach siehst du hier alles, was auch auf "
-                   "deiner Dropdex-Seite zu sehen ist: Fortschritt, alle Decks und Karten.")
+        st.caption("Hinterlege dein Profil oben – es wird danach automatisch geladen und zeigt hier "
+                   "alles, was auch auf deiner Dropdex-Seite zu sehen ist: Fortschritt, alle Decks und Karten.")
         return
 
     render_my_progress(user, my_inv)
@@ -4027,6 +4029,7 @@ def my_profile_picker(user: Dict[str, Any]) -> Tuple[str, str]:
                 st.session_state["auth_user"]["own_profile_name"] = ""
                 st.session_state.pop("myprofile_editing", None)
                 st.session_state.pop("search_pool", None)
+                st.session_state.pop("myprofile_inv", None)
                 st.rerun()
         if not st.session_state.get("myprofile_editing"):
             return saved_url, (saved_name or saved_url)
@@ -4048,6 +4051,8 @@ def my_profile_picker(user: Dict[str, Any]) -> Tuple[str, str]:
         st.session_state["auth_user"]["own_profile_url"] = url.strip()
         st.session_state["auth_user"]["own_profile_name"] = name.strip()
         st.session_state.pop("myprofile_editing", None)
+        st.session_state.pop("myprofile_inv", None)
+        st.session_state.pop("search_pool", None)
         st.rerun()
     st.markdown(
         '<div class="panel-hint">Dein eigenes Profil ist nur für dich sichtbar und bleibt an deinen '
@@ -4480,12 +4485,9 @@ def main() -> None:
     st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
 
     st.markdown(
-        '<div class="hero">'
+        '<div class="hero" style="padding-bottom:6px;">'
         '<img class="hero-logo" src="https://i.ibb.co/fzYSQgkj/Free-Schok-Studio.png" alt="FreeSchok Studio Logo"/>'
-        '<h1>🔄 Tauschbörse</h1>'
-        '<p>Tausche deine <strong>doppelten</strong> Karten – immer gleiche Seltenheit gegen gleiche, '
-        'deckübergreifend. Vergleicht zwei Dropdex-Profile und stellt daraus direkt passende '
-        '1:1-Tauschgeschäfte zusammen.</p></div>',
+        '</div>',
         unsafe_allow_html=True,
     )
 
