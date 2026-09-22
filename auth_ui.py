@@ -61,7 +61,7 @@ def _handle_oauth_callback() -> None:
 
     user = db.get_or_create_user(**twitch_user)
     if user["twitch_id"] in BOOTSTRAP_ADMIN_TWITCH_IDS and not user["is_admin"]:
-        db.set_admin(user["id"], True)
+        db.set_admin(user["id"], True)  # setzt intern auch is_approved = True
         user = db.get_user_by_twitch_id(user["twitch_id"])
 
     st.session_state["auth_user"] = user
@@ -130,6 +130,8 @@ def render_login_gate() -> bool:
                 st.markdown(f"**{user['twitch_username']}**")
                 if user["is_admin"]:
                     st.caption("🛡️ Admin")
+                elif user["is_supporter"]:
+                    st.caption("🧡 Supporter")
             if st.button("Ausloggen", use_container_width=True):
                 token = st.session_state.get("session_token")
                 if token:
@@ -152,14 +154,49 @@ def render_login_gate() -> bool:
         st.error("🚫 Dein Account ist für dieses Tool gesperrt.")
         return False
 
+    if not user["is_approved"]:
+        st.warning(
+            "⏳ Dein Account wartet noch auf Freigabe durch einen Admin oder Supporter. "
+            "Schau gleich nochmal vorbei – sobald du freigegeben bist, hast du automatisch Zugriff."
+        )
+        return False
+
     return True
 
 
 def render_admin_dashboard() -> None:
-    """Admin-Dashboard: Nutzerliste mit Sperren/Entsperren + Admin-Vergabe.
-    Rendert sich nur, wenn der eingeloggte Nutzer is_admin == True hat."""
+    """Moderations-Bereich: „Freigaben“ (neue User freischalten) für Admin + Supporter,
+    volle Nutzerverwaltung (Admin-/Supporter-Vergabe, Sperren) nur für Admins.
+    Rendert sich nur, wenn der eingeloggte Nutzer is_admin ODER is_supporter hat."""
     user = st.session_state.get("auth_user")
-    if not user or not user.get("is_admin"):
+    if not user or not (user.get("is_admin") or user.get("is_supporter")):
+        return
+
+    # ---- Freigaben: neue, noch nicht freigeschaltete User (Admin + Supporter) ----
+    pending = db.get_pending_users()
+    with st.expander(f"🟢 Freigaben ({len(pending)} wartend)", expanded=bool(pending)):
+        if not pending:
+            st.caption("Aktuell wartet niemand auf Freigabe.")
+        else:
+            for u in pending:
+                c_img, c_name, c_ok, c_ban = st.columns([1, 4, 2, 2])
+                with c_img:
+                    if u.get("profile_image_url"):
+                        st.image(u["profile_image_url"], width=36)
+                with c_name:
+                    st.markdown(f"**{u['twitch_username']}**")
+                    st.caption(f"Letzter Login: {u.get('last_login') or '–'}")
+                with c_ok:
+                    if st.button("✅ Freigeben", key=f"approve_{u['id']}", use_container_width=True):
+                        db.set_approved(u["id"], True)
+                        st.rerun()
+                with c_ban:
+                    if st.button("🚫 Bannen", key=f"reject_{u['id']}", use_container_width=True):
+                        db.set_banned(u["id"], True)
+                        st.rerun()
+
+    # ---- Volle Nutzerverwaltung (Admin/Supporter/Gesperrt/Freigegeben) nur für Admins ----
+    if not user.get("is_admin"):
         return
 
     with st.expander("🛠️ Admin-Dashboard: Nutzerverwaltung", expanded=False):
@@ -171,17 +208,20 @@ def render_admin_dashboard() -> None:
         st.caption(f"{len(users)} registrierte Nutzer – Häkchen setzen und speichern:")
 
         df = pd.DataFrame(users)[
-            ["id", "twitch_username", "twitch_id", "last_login", "is_admin", "is_banned"]
+            ["id", "twitch_username", "twitch_id", "last_login", "is_admin", "is_supporter",
+             "is_approved", "is_banned"]
         ].rename(columns={
             "id": "ID",
             "twitch_username": "Twitch-Name",
             "twitch_id": "Twitch-ID",
             "last_login": "Letzter Login",
             "is_admin": "Admin",
+            "is_supporter": "Supporter",
+            "is_approved": "Freigegeben",
             "is_banned": "Gesperrt",
         })
-        df["Admin"] = df["Admin"].astype(bool)
-        df["Gesperrt"] = df["Gesperrt"].astype(bool)
+        for col in ("Admin", "Supporter", "Freigegeben", "Gesperrt"):
+            df[col] = df[col].astype(bool)
 
         edited = st.data_editor(
             df,
@@ -191,6 +231,8 @@ def render_admin_dashboard() -> None:
                 "Twitch-ID": st.column_config.TextColumn(disabled=True),
                 "Letzter Login": st.column_config.TextColumn(disabled=True),
                 "Admin": st.column_config.CheckboxColumn(help="Adminrechte vergeben/entziehen"),
+                "Supporter": st.column_config.CheckboxColumn(help="Supporter-Rechte vergeben/entziehen"),
+                "Freigegeben": st.column_config.CheckboxColumn(help="Zugriff freischalten/entziehen"),
                 "Gesperrt": st.column_config.CheckboxColumn(help="Nutzer sperren/entsperren"),
             },
             hide_index=True,
@@ -208,6 +250,12 @@ def render_admin_dashboard() -> None:
                     continue
                 if bool(row["Admin"]) != bool(orig["is_admin"]):
                     db.set_admin(uid, bool(row["Admin"]))
+                    changed += 1
+                if bool(row["Supporter"]) != bool(orig["is_supporter"]):
+                    db.set_supporter(uid, bool(row["Supporter"]))
+                    changed += 1
+                if bool(row["Freigegeben"]) != bool(orig["is_approved"]):
+                    db.set_approved(uid, bool(row["Freigegeben"]))
                     changed += 1
                 if bool(row["Gesperrt"]) != bool(orig["is_banned"]):
                     db.set_banned(uid, bool(row["Gesperrt"]))
