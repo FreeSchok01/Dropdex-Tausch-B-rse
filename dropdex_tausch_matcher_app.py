@@ -2858,26 +2858,42 @@ BG_IMAGE_B64 = (
 
 CSS = """
 <style>
-    /* ---- Leere Streamlit-Kopfleiste ganz oben komplett ausblenden ---- */
+    /* ---- Leere Streamlit-Kopfleiste ganz oben komplett ausblenden ----
+       WICHTIG: visibility (nicht display) verwenden! Bei display:none werden
+       auch alle Kind-Elemente (u.a. der Sidebar-Öffnen-Button, der hier drin
+       sitzt) komplett aus dem Rendering entfernt und lassen sich durch KEIN
+       CSS am Kind-Element mehr zurückholen. visibility:hidden kann dagegen
+       gezielt von einem Kind-Element wieder auf visible gesetzt werden. */
     header[data-testid="stHeader"],
     div[data-testid="stDecoration"],
     div[data-testid="stStatusWidget"] {
-        display: none !important;
+        visibility: hidden !important;
         height: 0 !important;
+        min-height: 0 !important;
+        overflow: visible !important;
     }
 
     /* ---- Sidebar-Öffnen-Button (Pfeil) sichtbar lassen ----
-       Der Button sitzt normalerweise in der oben ausgeblendeten Kopfleiste.
-       Ohne diese Regel verschwindet er mit -> zugeklappte Sidebar lässt sich
-       nicht mehr öffnen. Wir holen ihn per fixed-Position wieder sichtbar. */
-    div[data-testid="stSidebarCollapsedControl"] {
-        display: flex !important;
+       Deckt beide je nach Streamlit-Version möglichen Selector-Namen ab
+       (ältere Versionen: "collapsedControl", neuere: "stSidebarCollapsedControl"),
+       egal ob als div oder button gerendert. Wird per fixed-Position oben
+       links wieder sichtbar gemacht, unabhängig von der ausgeblendeten
+       Kopfleiste drum herum. */
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"] {
         visibility: visible !important;
+        display: flex !important;
         opacity: 1 !important;
         position: fixed !important;
         top: 0.6rem !important;
         left: 0.6rem !important;
+        height: auto !important;
         z-index: 999999 !important;
+        pointer-events: auto !important;
+    }
+    [data-testid="stSidebarCollapsedControl"] *,
+    [data-testid="collapsedControl"] * {
+        visibility: visible !important;
     }
 
     .stApp {
