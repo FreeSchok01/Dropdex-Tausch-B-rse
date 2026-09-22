@@ -2860,10 +2860,7 @@ CSS = """
 <style>
     /* ---- Leere Streamlit-Kopfleiste ganz oben komplett ausblenden ----
        WICHTIG: visibility (nicht display) verwenden! Bei display:none werden
-       auch alle Kind-Elemente (u.a. der Sidebar-Öffnen-Button, der hier drin
-       sitzt) komplett aus dem Rendering entfernt und lassen sich durch KEIN
-       CSS am Kind-Element mehr zurückholen. visibility:hidden kann dagegen
-       gezielt von einem Kind-Element wieder auf visible gesetzt werden. */
+       auch alle Kind-Elemente aus dem Rendering entfernt. */
     header[data-testid="stHeader"],
     div[data-testid="stDecoration"],
     div[data-testid="stStatusWidget"] {
@@ -2873,27 +2870,32 @@ CSS = """
         overflow: visible !important;
     }
 
-    /* ---- Sidebar-Öffnen-Button (Pfeil) sichtbar lassen ----
-       Deckt beide je nach Streamlit-Version möglichen Selector-Namen ab
-       (ältere Versionen: "collapsedControl", neuere: "stSidebarCollapsedControl"),
-       egal ob als div oder button gerendert. Wird per fixed-Position oben
-       links wieder sichtbar gemacht, unabhängig von der ausgeblendeten
-       Kopfleiste drum herum. */
-    [data-testid="stSidebarCollapsedControl"],
-    [data-testid="collapsedControl"] {
+    /* ---- Sidebar dauerhaft angepinnt (nicht mehr zuklappbar) ----
+       Statt den "Wieder öffnen"-Button zu reparieren, verhindern wir das
+       Zuklappen direkt: Breite/Transform wird immer erzwungen, egal welchen
+       aria-expanded-Status Streamlit intern setzt. Die Zu-/Aufklapp-Buttons
+       werden komplett ausgeblendet, da sie dadurch überflüssig sind. */
+    section[data-testid="stSidebar"] {
+        min-width: 320px !important;
+        width: 320px !important;
+        max-width: 320px !important;
+        transform: none !important;
         visibility: visible !important;
-        display: flex !important;
-        opacity: 1 !important;
-        position: fixed !important;
-        top: 0.6rem !important;
-        left: 0.6rem !important;
-        height: auto !important;
-        z-index: 999999 !important;
-        pointer-events: auto !important;
+        position: relative !important;
+        flex-shrink: 0 !important;
     }
-    [data-testid="stSidebarCollapsedControl"] *,
-    [data-testid="collapsedControl"] * {
-        visibility: visible !important;
+    section[data-testid="stSidebar"][aria-expanded="false"] {
+        min-width: 320px !important;
+        width: 320px !important;
+        max-width: 320px !important;
+        margin-left: 0 !important;
+        transform: none !important;
+    }
+    [data-testid="stSidebarCollapsedControl"],
+    [data-testid="collapsedControl"],
+    [data-testid="stSidebarCollapseButton"],
+    section[data-testid="stSidebar"] button[kind="header"] {
+        display: none !important;
     }
 
     .stApp {
@@ -4146,7 +4148,12 @@ def render_admin_tab(name_map: Dict[str, str]) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Tauschbörse · Dropdex Matcher", page_icon="🔄", layout="wide")
+    st.set_page_config(
+        page_title="Tauschbörse · Dropdex Matcher",
+        page_icon="🔄",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
 
     st.markdown(
