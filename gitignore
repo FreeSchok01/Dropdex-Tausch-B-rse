@@ -1,0 +1,16 @@
+# Secrets & lokale Konfiguration
+.env
+.streamlit/secrets.toml
+
+# Nutzer-Datenbank (enthält Twitch-IDs, entsteht automatisch neu)
+dropdex_users.db
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sonstiges
+.DS_Store
