@@ -3508,6 +3508,7 @@ def render_my_profile_page(user: Dict[str, Any]) -> None:
     Fortschritt sowie alle Decks samt Karten (besessen + fehlend), genau wie auf dropdex.de selbst.
     Enthält bewusst KEINE Tauschpartner-Suche mehr – die läuft jetzt über die eigenen Reiter
     „🔍 Meine fehlende Karten“ und „🎯 Karte loswerden“."""
+    st.markdown('<div class="section-title">👤 Mein Profil</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     my_url, my_name = my_profile_picker(user)
     load_clicked = st.button("📥 Mein Profil laden", type="primary", key="myprofile_load",
@@ -4494,32 +4495,6 @@ def main() -> None:
 
     user = st.session_state["auth_user"]
 
-    # ---- Toolbar: Seltenheiten-Filter (oben, gilt für alle Bereiche) ----
-    with st.container():
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
-        rarity_options = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
-        selected_rarities = st.multiselect(
-            "Seltenheiten filtern", options=rarity_options, default=rarity_options,
-            format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
-        )
-        with st.expander("ℹ️ Funktionsweise"):
-            st.markdown(
-                "1. **👤 Mein Profil:** Eigenes Profil hinterlegen und vollständig ansehen – Fortschritt, "
-                "alle Decks und Karten, genau wie auf dropdex.de.\n"
-                "2. **🔍 Meine fehlende Karten:** Zeigt, welche deiner fehlenden Karten du 1:1 gegen eine "
-                "Dublette tauschen kannst, und findet dazu passende Partner aus deinen gespeicherten Profilen.\n"
-                "3. **🎯 Karte loswerden:** Kartennamen eingeben, den du loswerden willst – die App sucht, "
-                "wem diese Karte fehlt und was er dir im Gegenzug anbieten kann.\n"
-                "4. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 (oder einen "
-                "Favoriten ⭐) und vergleiche.\n"
-                "5. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
-                "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
-                "6. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
-                "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥)."
-            )
-        st.markdown('</div>', unsafe_allow_html=True)
-
     name_map = load_name_map()
 
     # ---- Navigation links (Sidebar) ----
@@ -4529,6 +4504,32 @@ def main() -> None:
     with st.sidebar:
         st.divider()
         page = st.radio("📍 Bereich", nav_options, key="nav_page")
+
+    # ---- Toolbar: Seltenheiten-Filter – gilt nur für die Tauschbörse-Bereiche, nicht für
+    # „Mein Profil“ (dort werden immer ALLE Karten des eigenen Profils angezeigt, wie auf dropdex.de). ----
+    selected_rarities: List[str] = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
+    if page != "👤 Mein Profil":
+        with st.container():
+            st.markdown('<div class="panel">', unsafe_allow_html=True)
+            st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
+            selected_rarities = st.multiselect(
+                "Seltenheiten filtern", options=selected_rarities, default=selected_rarities,
+                format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
+            )
+            with st.expander("ℹ️ Funktionsweise"):
+                st.markdown(
+                    "1. **🔍 Meine fehlende Karten:** Zeigt, welche deiner fehlenden Karten du 1:1 gegen eine "
+                    "Dublette tauschen kannst, und findet dazu passende Partner aus deinen gespeicherten Profilen.\n"
+                    "2. **🎯 Karte loswerden:** Kartennamen eingeben, den du loswerden willst – die App sucht, "
+                    "wem diese Karte fehlt und was er dir im Gegenzug anbieten kann.\n"
+                    "3. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 (oder einen "
+                    "Favoriten ⭐) und vergleiche.\n"
+                    "4. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
+                    "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
+                    "5. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
+                    "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥)."
+                )
+            st.markdown('</div>', unsafe_allow_html=True)
 
     if page == "👤 Mein Profil":
         render_my_profile_page(user)
