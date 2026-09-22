@@ -292,7 +292,8 @@ def render_admin_dashboard() -> None:
     is_full_admin = bool(user.get("is_admin"))
     st.markdown(ADMIN_CSS, unsafe_allow_html=True)
 
-    with st.expander("🛠️ Moderations-Dashboard", expanded=False):
+    st.markdown('<div class="section-title">🛠️ Moderations-Dashboard</div>', unsafe_allow_html=True)
+    with st.container(border=True):
         all_users = db.get_all_users()
         pending_count = sum(1 for u in all_users if not u["is_approved"] and not u["is_banned"])
         banned_count = sum(1 for u in all_users if u["is_banned"])
