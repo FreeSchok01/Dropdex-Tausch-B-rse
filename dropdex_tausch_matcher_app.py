@@ -2928,6 +2928,9 @@ CSS = """
 
     .hero-logo { height: 46px; display: block; margin: 0 0 12px 0; }
 
+    .mycard-grid { display: flex; flex-wrap: wrap; gap: 14px; margin: 6px 0 10px 0; }
+    .mycard-cell { display: flex; flex-direction: column; align-items: center; width: 108px; }
+
     .trade-card {
         background: linear-gradient(180deg, #171826 0%, #121320 100%);
         border: 1px solid #2a2c40; border-radius: 14px;
@@ -3458,6 +3461,234 @@ def render_my_full_inventory(my_inv: List[Dict[str, Any]]) -> None:
         } for c in rows]), hide_index=True, use_container_width=True)
 
 
+def load_my_full_profile(my_url: str) -> Optional[List[Dict[str, Any]]]:
+    """Lädt NUR das eigene Profil (keine Partner) und wählt die ergiebigste Auswerte-Schicht –
+    für die vollständige Profilansicht in „👤 Mein Profil“."""
+    layers = load_profile_layers(my_url)
+    for name in SEARCH_LAYERS:
+        if name in layers and layers[name]:
+            return layers[name]
+    return None
+
+
+def render_my_profile_grid(my_inv: List[Dict[str, Any]]) -> None:
+    """Zeigt das eigene Profil deckweise als Kartenraster – so, wie es auch auf der eigenen
+    Dropdex-Seite zu sehen ist: besessene UND fehlende Karten, mit Bild, Seltenheit, Slot,
+    Streamer und Anzahl."""
+    by_deck: Dict[str, List[Dict[str, Any]]] = {}
+    for c in my_inv:
+        by_deck.setdefault(c.get("deck", "") or "Ohne Deck", []).append(c)
+
+    st.markdown('<div class="section-title">🗂️ Meine Decks</div>', unsafe_allow_html=True)
+    for deck_name in sorted(by_deck, key=lambda d: d.lower()):
+        cards = sorted(by_deck[deck_name], key=lambda c: c.get("slot", 0))
+        owned = sum(1 for c in cards if c["count"] > 0)
+        total = len(cards)
+        streamer = next((c.get("streamer") for c in cards if c.get("streamer")), "")
+        title = f"{deck_name}" + (f" von {streamer}" if streamer else "") + f" · {owned}/{total}"
+        with st.expander(title, expanded=False):
+            parts = ['<div class="mycard-grid">']
+            for c in cards:
+                rarity = c.get("rarity", "UNKNOWN")
+                if c["count"] > 0:
+                    thumb = _card_thumb_html(c, rarity)
+                else:
+                    thumb = _card_thumb_html(None, rarity, empty_hint=RARITY_LABEL_DE.get(rarity, rarity))
+                count_tag = (
+                    f'<div class="card-name" style="color:#7aa2ff;">×{c["count"]}</div>'
+                    if c["count"] > 1 else ""
+                )
+                parts.append(f'<div class="mycard-cell">{thumb}{count_tag}</div>')
+            parts.append('</div>')
+            st.markdown("".join(parts), unsafe_allow_html=True)
+
+
+def render_my_profile_page(user: Dict[str, Any]) -> None:
+    """Bereich „👤 Mein Profil“: zeigt das eigene, hinterlegte Dropdex-Profil vollständig an –
+    Fortschritt sowie alle Decks samt Karten (besessen + fehlend), genau wie auf dropdex.de selbst.
+    Enthält bewusst KEINE Tauschpartner-Suche mehr – die läuft jetzt über die eigenen Reiter
+    „🔍 Meine fehlende Karten“ und „🎯 Karte loswerden“."""
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    my_url, my_name = my_profile_picker(user)
+    load_clicked = st.button("📥 Mein Profil laden", type="primary", key="myprofile_load",
+                             disabled=not my_url.strip())
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if load_clicked:
+        with st.spinner("Lade dein Dropdex-Profil …"):
+            try:
+                my_inv = load_my_full_profile(my_url)
+            except Exception as e:  # noqa: BLE001
+                st.session_state.pop("myprofile_inv", None)
+                st.error(f"Dein Profil konnte nicht geladen werden: {e}")
+                return
+        if not my_inv:
+            st.session_state.pop("myprofile_inv", None)
+            st.error("In deinem Profil wurden keine Kartendaten gefunden.")
+            return
+        st.session_state["myprofile_inv"] = my_inv
+
+        owned = sum(1 for c in my_inv if c["count"] > 0)
+        total = len(my_inv)
+        db.add_progress_snapshot(
+            user_id=user["id"], distinct_owned=owned, distinct_total=total,
+            total_copies=sum(c["count"] for c in my_inv), missing_count=total - owned,
+        )
+
+    my_inv = st.session_state.get("myprofile_inv")
+    if not my_inv:
+        st.caption("Wähle dein Profil und lade es – danach siehst du hier alles, was auch auf "
+                   "deiner Dropdex-Seite zu sehen ist: Fortschritt, alle Decks und Karten.")
+        return
+
+    render_my_progress(user, my_inv)
+    render_my_profile_grid(my_inv)
+    render_my_full_inventory(my_inv)
+
+
+def find_card_recipients(
+    card: Dict[str, Any], my_inv: List[Dict[str, Any]], partner_invs: Dict[str, Tuple[str, List[Dict[str, Any]]]]
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Für „🎯 Karte loswerden“: Wem fehlt `card` (die ich als Dublette loswerden will) komplett,
+    und was könnte er mir im Gegenzug geben (seine Dubletten gleicher Seltenheit, die mir komplett
+    fehlen)? Gibt (Empfänger mit Gegenangebot, Empfänger OHNE passendes Gegenangebot) zurück."""
+    cid, rarity = card["id"], card["rarity"]
+    my_missing_ids = {c["id"] for c in my_inv if c["count"] == 0 and c["rarity"] == rarity}
+    recipients: List[Dict[str, Any]] = []
+    no_offer: List[str] = []
+    for _url, (label, inv) in partner_invs.items():
+        counts = {c["id"]: c["count"] for c in inv}
+        if counts.get(cid, 0) != 0:
+            continue  # hat die Karte schon (oder ist unbekannt) -> braucht sie nicht
+        counters = [
+            {**c, "offerer_count": c["count"]}
+            for c in inv
+            if c["count"] > 1 and c["id"] in my_missing_ids
+        ]
+        if counters:
+            recipients.append({"label": label, "counters": counters})
+        else:
+            no_offer.append(label)
+    recipients.sort(key=lambda r: (-len(r["counters"]), r["label"].lower()))
+    return recipients, no_offer
+
+
+def render_get_rid_tab(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
+    """Bereich „🎯 Karte loswerden“: Kartennamen eingeben, den man loswerden will (eigene Dublette) –
+    die App sucht Nutzer, denen genau diese Karte fehlt, sowie deren mögliche Gegenangebote."""
+    st.markdown('<div class="section-title">🎯 Karte loswerden</div>', unsafe_allow_html=True)
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    my_url, my_name = my_profile_picker(user)
+    my_norm = normalize_url(my_url) if my_url.strip() else ""
+    partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
+    st.markdown(
+        f'<div class="panel-hint">Als mögliche Empfänger dienen deine {len(partners)} anderen gespeicherten '
+        f'Profile.</div>',
+        unsafe_allow_html=True,
+    )
+    load_clicked = st.button("📥 Meine Karten laden", type="primary", key="ridcard_load",
+                             disabled=not my_url.strip())
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if load_clicked:
+        bar = st.progress(0.0, text="Lade Profile …")
+        try:
+            pool = load_search_pool(my_url, my_name, partners, lambda f, t: bar.progress(min(f, 1.0), text=t))
+        except Exception as e:  # noqa: BLE001
+            bar.empty()
+            st.session_state.pop("search_pool", None)
+            st.error(f"Dein Profil konnte nicht geladen werden: {e}")
+            return
+        bar.empty()
+        if not pool["me"]:
+            st.session_state.pop("search_pool", None)
+            st.error("In deinem Profil wurden keine Kartendaten gefunden.")
+            return
+        st.session_state["search_pool"] = pool
+
+    pool = st.session_state.get("search_pool")
+    if not pool:
+        st.caption("Lade dein Profil (oben) – danach kannst du nach einer Karte suchen, die du "
+                   "loswerden möchtest, und wir finden dir passende Empfänger dafür.")
+        return
+
+    layer = pick_search_layer(pool)
+    if layer is None:
+        st.error("Die Profildaten konnten nicht ausgewertet werden.")
+        return
+    me_label = pool["me_label"]
+    my_inv = pool["me"][layer]
+    partner_invs = {u: (p["label"], p["layers"][layer]) for u, p in pool["partners"].items() if layer in p["layers"]}
+    not_loaded = [p["label"] for p in pool["partners"].values() if layer not in p["layers"]]
+    if not_loaded:
+        st.caption("⚠️ Nicht geladen / keine Daten: " + ", ".join(not_loaded))
+
+    my_dups = [c for c in my_inv
+              if c["count"] > 1 and (c["rarity"] in selected_rarities or c["rarity"] == "UNKNOWN")]
+    my_dups.sort(key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("deck", ""), c.get("slot", 0)))
+    if not my_dups:
+        st.info("Du hast aktuell keine Dubletten, die du loswerden könntest.")
+        return
+
+    q = st.text_input("Kartenname eingeben, den du loswerden willst",
+                      placeholder="z. B. Headset, Mikro, …", key="ridcard_query")
+    tokens = [t for t in re.split(r"\s+", q.lower().strip()) if t]
+    shown = [c for c in my_dups
+             if all(t in f'{c["name"]} {c.get("deck", "")} {c.get("streamer", "")}'.lower() for t in tokens)]
+    if not tokens:
+        st.caption(f"Du hast {len(my_dups)} Dubletten. Tippe oben einen Namen, um zu filtern.")
+    if not shown:
+        st.info("Keine deiner Dubletten passt zu dieser Suche.")
+        return
+
+    by_id = {c["id"]: c for c in shown}
+
+    def _label(cid: Optional[str]) -> str:
+        if cid is None:
+            return "— Karte auswählen —"
+        c = by_id[cid]
+        extra = f" · 🎥 {c['streamer']}" if c.get("streamer") else ""
+        return f"🔁 {c['name']} ×{c['count']} · {RARITY_LABEL_DE.get(c['rarity'], c['rarity'])} · {c.get('deck', '')}{extra}"
+
+    pick = st.selectbox("Karte wählen", [None] + list(by_id), format_func=_label, key="ridcard_pick",
+                        label_visibility="collapsed")
+    if pick is None:
+        return
+
+    card = by_id[pick]
+    rarity = card["rarity"]
+    rarity_label = RARITY_LABEL_DE.get(rarity, rarity)
+    badge = RARITY_BADGE.get(rarity, "badge-common")
+    sub = " · ".join(x for x in (
+        html_lib.escape(str(card.get("deck", ""))),
+        ("🎥 " + html_lib.escape(str(card["streamer"]))) if card.get("streamer") else "",
+    ) if x)
+    st.markdown(
+        f'<div class="section-title" style="margin-top:18px;">🃏 {html_lib.escape(card["name"])} '
+        f'<span class="{badge}">{html_lib.escape(rarity_label)}</span></div>'
+        f'<div class="panel-hint">{sub}</div>',
+        unsafe_allow_html=True,
+    )
+
+    recipients, no_offer = find_card_recipients(card, my_inv, partner_invs)
+    if not recipients and not no_offer:
+        st.info("Aktuell fehlt diese Karte keinem deiner gespeicherten Profile.")
+        return
+    for r in recipients:
+        give = {**card, "offerer_count": card["count"]}
+        counters = r["counters"]
+        st.markdown(f"**✅ 👤 {html_lib.escape(r['label'])}** · braucht diese Karte · "
+                    f"**{len(counters)}** mögliche Gegenkarte(n) von {html_lib.escape(r['label'])}")
+        cards_html = [_trade_card_html(me_label, r["label"], give, c, rarity) for c in counters]
+        st.markdown("".join(cards_html[:3]), unsafe_allow_html=True)
+        if len(cards_html) > 3:
+            with st.expander(f"Weitere {len(cards_html) - 3} Tauschmöglichkeiten mit {r['label']}"):
+                st.markdown("".join(cards_html[3:]), unsafe_allow_html=True)
+    if no_offer:
+        st.warning(f"{len(no_offer)} Profil(e) brauchen diese Karte, aber du hast aktuell keine passende "
+                   f"Gegenkarte ({rarity_label}), die ihnen fehlt: " + ", ".join(no_offer))
+
+
 def render_search_section(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
     """Oben auf der Seite: eigenes Profil laden -> alle fehlenden Karten -> Karte wählen -> Tauschpartner."""
     st.markdown('<div class="section-title">🔍 Kartensuche & Tauschpartner</div>', unsafe_allow_html=True)
@@ -3689,11 +3920,15 @@ def stat_card(label: str, value: str, extra: str = "") -> str:
     )
 
 
-def profile_picker(label: str, slot: str, name_map: Dict[str, str], allow_new: bool = True) -> Tuple[str, str]:
+def profile_picker(
+    label: str, slot: str, name_map: Dict[str, str], allow_new: bool = True,
+    user: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
     """Profil-Auswahl per Panel: gespeicherte Profile per Dropdown wählen (nur Name sichtbar,
     keine URL) oder – falls allow_new=True – ein neues per URL + Name anlegen und dauerhaft
     speichern (dropdex_namen.json). Mit allow_new=False (z.B. im 1:1-Tausch) kann nur aus der
-    bestehenden, öffentlichen Liste gewählt werden."""
+    bestehenden, öffentlichen Liste gewählt werden. Wird `user` übergeben, gibt es zusätzlich
+    eine Favoriten-Schnellauswahl sowie einen Stern-Button zum Favorisieren des gewählten Profils."""
     st.markdown(f'<div class="panel-label">👤 {html_lib.escape(label)}</div>', unsafe_allow_html=True)
 
     saved = sorted(name_map.items(), key=lambda kv: kv[1].lower())  # [(url, name), ...]
@@ -3702,6 +3937,21 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str], allow_new: b
     if not saved and not allow_new:
         st.info("Noch keine öffentlichen Profile vorhanden – ein Admin muss zuerst welche hinzufügen.")
         return "", ""
+
+    favorites = db.get_favorites(user["id"]) if user is not None else []
+    if favorites:
+        fav_placeholder = "⭐ Favorit wählen …"
+        fav_options = [fav_placeholder] + [f["profile_name"] for f in favorites]
+        fav_choice = st.selectbox(
+            "Favoriten", fav_options, key=f"favpick_{slot}", label_visibility="collapsed",
+        )
+        if fav_choice != fav_placeholder:
+            match = next((f for f in favorites if f["profile_name"] == fav_choice), None)
+            if match:
+                current_name = name_map.get(match["profile_url"], match["profile_name"])
+                if current_name in [n for _, n in saved] and st.session_state.get(f"picker_{slot}") != current_name:
+                    st.session_state[f"picker_{slot}"] = current_name
+                    st.rerun()
 
     options = ([new_entry_label] if allow_new else []) + [name for _, name in saved]
     choice = st.selectbox(
@@ -3735,6 +3985,15 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str], allow_new: b
     idx = options.index(choice) - (1 if allow_new else 0)
     url, name = saved[idx]
     st.markdown(f'<div class="panel-hint">✅ Ausgewählt: {html_lib.escape(name)}</div>', unsafe_allow_html=True)
+    if user is not None:
+        if db.is_favorite(user["id"], url):
+            if st.button("★ Favorit entfernen", key=f"unfav_{slot}"):
+                db.remove_favorite(user["id"], url)
+                st.rerun()
+        else:
+            if st.button("☆ Zu Favoriten hinzufügen", key=f"fav_{slot}"):
+                db.add_favorite(user["id"], url, name)
+                st.rerun()
     # Hinweis: Das Entfernen aus dieser öffentlichen, gemeinsamen Profilliste ist bewusst nur
     # im Admin-Dashboard möglich (siehe _admin_delete_profiles) – nicht hier, da sonst jeder
     # eingeloggte Nutzer fremde, für alle sichtbare Profile löschen könnte.
@@ -4111,7 +4370,7 @@ def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], use
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        url_p2, name_p2 = profile_picker("Spieler 2", "p2", name_map, allow_new=False)
+        url_p2, name_p2 = profile_picker("Spieler 2", "p2", name_map, allow_new=False, user=user)
         st.markdown('</div>', unsafe_allow_html=True)
 
     url_p1, name_p1 = own_url, (own_name or own_url)
@@ -4246,11 +4505,17 @@ def main() -> None:
         )
         with st.expander("ℹ️ Funktionsweise"):
             st.markdown(
-                "1. **👤 Mein Profil:** Eigenes Profil hinterlegen, fehlende Karten & Fortschritt ansehen.\n"
-                "2. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 und vergleiche.\n"
-                "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
+                "1. **👤 Mein Profil:** Eigenes Profil hinterlegen und vollständig ansehen – Fortschritt, "
+                "alle Decks und Karten, genau wie auf dropdex.de.\n"
+                "2. **🔍 Meine fehlende Karten:** Zeigt, welche deiner fehlenden Karten du 1:1 gegen eine "
+                "Dublette tauschen kannst, und findet dazu passende Partner aus deinen gespeicherten Profilen.\n"
+                "3. **🎯 Karte loswerden:** Kartennamen eingeben, den du loswerden willst – die App sucht, "
+                "wem diese Karte fehlt und was er dir im Gegenzug anbieten kann.\n"
+                "4. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 (oder einen "
+                "Favoriten ⭐) und vergleiche.\n"
+                "5. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
                 "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
-                "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
+                "6. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
                 "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥)."
             )
         st.markdown('</div>', unsafe_allow_html=True)
@@ -4258,7 +4523,7 @@ def main() -> None:
     name_map = load_name_map()
 
     # ---- Navigation links (Sidebar) ----
-    nav_options = ["👤 Mein Profil", "🔄 1:1 Tausch"]
+    nav_options = ["👤 Mein Profil", "🔍 Meine fehlende Karten", "🎯 Karte loswerden", "🔄 1:1 Tausch"]
     if user.get("is_admin") or user.get("is_supporter"):
         nav_options.append("🛠️ Admin")
     with st.sidebar:
@@ -4266,7 +4531,11 @@ def main() -> None:
         page = st.radio("📍 Bereich", nav_options, key="nav_page")
 
     if page == "👤 Mein Profil":
+        render_my_profile_page(user)
+    elif page == "🔍 Meine fehlende Karten":
         render_search_section(name_map, selected_rarities, user)
+    elif page == "🎯 Karte loswerden":
+        render_get_rid_tab(name_map, selected_rarities, user)
     elif page == "🔄 1:1 Tausch":
         render_trade_tab(name_map, selected_rarities, user)
     elif page == "🛠️ Admin":
