@@ -94,6 +94,33 @@ def _restore_session_from_url() -> None:
         st.query_params.clear()
 
 
+def _render_center_login() -> None:
+    """Login-Button mittig im Hauptbereich (zusätzlich zur Sidebar).
+    Wichtig, falls die Sidebar auf dem Gerät/Browser des Nutzers zugeklappt
+    oder der Öffnen-Button gerade nicht sichtbar ist - dann kommt man trotzdem
+    ohne die Sidebar zum Login."""
+    login_url = twitch_auth.get_login_url()
+    st.markdown("<div style='height: 10vh;'></div>", unsafe_allow_html=True)
+    col_l, col_mid, col_r = st.columns([1, 1.4, 1])
+    with col_mid:
+        st.markdown(
+            "<div style='text-align:center; font-size:2.4rem;'>👋</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            "<h3 style='text-align:center; margin-top:0;'>Anmeldung erforderlich</h3>"
+            "<p style='text-align:center; color:#a2a4bd;'>"
+            "Melde dich mit Twitch an, um die Tauschbörse zu nutzen.</p>",
+            unsafe_allow_html=True,
+        )
+        st.link_button(
+            "🟣 Mit Twitch anmelden",
+            login_url,
+            type="primary",
+            use_container_width=True,
+        )
+
+
 def render_login_gate() -> bool:
     """Login-Button / Bann-Meldung in der Sidebar.
 
@@ -147,7 +174,7 @@ def render_login_gate() -> bool:
         st.divider()
 
     if not user:
-        st.info("👋 Bitte melde dich links in der Seitenleiste mit Twitch an, um die Tauschbörse zu nutzen.")
+        _render_center_login()
         return False
 
     if user["is_banned"]:
