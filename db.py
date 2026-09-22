@@ -125,6 +125,19 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL,
+                profile_url   TEXT NOT NULL,
+                profile_name  TEXT NOT NULL,
+                added_at      TEXT NOT NULL,
+                UNIQUE(user_id, profile_url)
+            )
+            """
+        )
+
 
 def get_user_by_twitch_id(twitch_id: str) -> Optional[Dict[str, Any]]:
     with get_connection() as conn:
@@ -318,3 +331,43 @@ def delete_expired_sessions() -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+
+
+# ---------------------------------------------------------------------------
+# Favoriten (im 1:1-Tausch als "Spieler 2" gespeicherte Wunschpartner je Account)
+# ---------------------------------------------------------------------------
+
+def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
+    """Merkt sich ein Profil als Favorit für diesen Account (überschreibt den Namen, falls das
+    Profil schon favorisiert war und sich der Name inzwischen geändert hat)."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO favorites (user_id, profile_url, profile_name, added_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
+            (user_id, profile_url, profile_name, now),
+        )
+
+
+def remove_favorite(user_id: int, profile_url: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?", (user_id, profile_url)
+        )
+
+
+def get_favorites(user_id: int) -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def is_favorite(user_id: int, profile_url: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?", (user_id, profile_url)
+        ).fetchone()
+        return row is not None
