@@ -13,12 +13,22 @@ Tabelle `users`:
     is_admin            INTEGER (0/1)
     is_banned           INTEGER (0/1)
     last_login          TEXT (ISO-Zeitstempel, UTC)
+    own_profile_url     TEXT             (eigenes, privates Dropdex-Profil des Accounts)
+    own_profile_name    TEXT
+
+Tabelle `progress_snapshots` (Verlauf des Sammelfortschritts pro Nutzer):
+    id                  INTEGER PRIMARY KEY
+    user_id             INTEGER          (-> users.id)
+    taken_at            TEXT (ISO-Zeitstempel, UTC)
+    distinct_owned      INTEGER          (verschiedene besessene Karten)
+    distinct_total      INTEGER          (verschiedene Karten insgesamt im Profil)
+    total_copies        INTEGER          (Karten insgesamt inkl. Dubletten)
+    missing_count       INTEGER          (fehlende, verschiedene Karten)
 """
 
-import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,8 +49,17 @@ def get_connection():
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Fügt eine Spalte nachträglich hinzu, falls sie in einer bestehenden DB noch fehlt
+    (SQLite kennt kein 'ADD COLUMN IF NOT EXISTS', daher der try/except-Umweg)."""
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def init_db() -> None:
-    """Legt die Tabellen an, falls sie noch nicht existieren. Idempotent."""
+    """Legt die Tabellen an, falls sie noch nicht existieren, und ergänzt fehlende
+    Spalten in bereits bestehenden Datenbanken. Idempotent."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -55,16 +74,20 @@ def init_db() -> None:
             )
             """
         )
-        # Für den "eingeloggt bleiben"-Mechanismus: ein langlebiges Session-Token,
-        # das (statt der Twitch-Zugangsdaten) in der URL mitgeführt wird, damit ein
-        # Reload (F5) nicht ausloggt.
+        _ensure_column(conn, "users", "own_profile_url", "TEXT DEFAULT ''")
+        _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
+
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS sessions (
-                token       TEXT PRIMARY KEY,
-                twitch_id   TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                expires_at  TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS progress_snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                taken_at        TEXT NOT NULL,
+                distinct_owned  INTEGER NOT NULL,
+                distinct_total  INTEGER NOT NULL,
+                total_copies    INTEGER NOT NULL,
+                missing_count   INTEGER NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
             )
             """
         )
@@ -134,46 +157,57 @@ def set_admin(user_id: int, admin: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sessions: "eingeloggt bleiben" über einen Seiten-Reload hinweg.
+# Eigenes (privates) Profil je Account
 # ---------------------------------------------------------------------------
 
-SESSION_TTL_DAYS = 30
-
-
-def create_session(twitch_id: str) -> str:
-    """Legt ein neues, langlebiges Session-Token für diesen Nutzer an und gibt es zurück."""
-    token = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
-    expires = now + timedelta(days=SESSION_TTL_DAYS)
+def set_own_profile(user_id: int, url: str, name: str) -> None:
+    """Speichert/aktualisiert das private Dropdex-Profil des eingeloggten Nutzers.
+    Leere Strings (url='') entfernen die Hinterlegung wieder."""
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, twitch_id, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
+            "UPDATE users SET own_profile_url = ?, own_profile_name = ? WHERE id = ?",
+            (url.strip(), name.strip(), user_id),
         )
-    return token
 
 
-def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
-    """Löst ein Session-Token auf: gültig + nicht abgelaufen -> zugehöriger Nutzer, sonst None."""
-    if not token:
-        return None
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+# ---------------------------------------------------------------------------
+# Fortschrittsverlauf ("Gesamtfortschritt") je Account
+# ---------------------------------------------------------------------------
+
+def add_progress_snapshot(
+    user_id: int,
+    distinct_owned: int,
+    distinct_total: int,
+    total_copies: int,
+    missing_count: int,
+) -> None:
+    """Speichert einen neuen Fortschritts-Schnappschuss (z.B. bei jedem Laden des
+    eigenen Profils in der Kartensuche)."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO progress_snapshots "
+            "(user_id, taken_at, distinct_owned, distinct_total, total_copies, missing_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, now, distinct_owned, distinct_total, total_copies, missing_count),
+        )
+
+
+def get_progress_history(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Liefert die letzten Fortschritts-Schnappschüsse eines Nutzers, älteste zuerst
+    (praktisch für Verlaufs-Charts)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+
+def get_latest_progress(user_id: int) -> Optional[Dict[str, Any]]:
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT twitch_id FROM sessions WHERE token = ? AND expires_at > ?",
-            (token, now_iso),
+            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT 1",
+            (user_id,),
         ).fetchone()
-    if not row:
-        return None
-    return get_user_by_twitch_id(row["twitch_id"])
-
-
-def delete_session(token: str) -> None:
-    with get_connection() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-
-
-def delete_expired_sessions() -> None:
-    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso,))
+        return dict(row) if row else None
