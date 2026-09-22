@@ -147,19 +147,26 @@ def render_login_gate() -> bool:
             st.session_state.pop("auth_user", None)
 
     with st.sidebar:
-        st.markdown("### 👤 Account")
+        st.markdown('<div class="side-nav-label">ACCOUNT</div>', unsafe_allow_html=True)
         if user:
-            col_img, col_name = st.columns([1, 3])
-            with col_img:
-                if user.get("profile_image_url"):
-                    st.image(user["profile_image_url"], width=48)
-            with col_name:
-                st.markdown(f"**{user['twitch_username']}**")
-                if user["is_admin"]:
-                    st.caption("🛡️ Admin")
-                elif user["is_supporter"]:
-                    st.caption("🧡 Supporter")
-            if st.button("Ausloggen", use_container_width=True):
+            if user.get("profile_image_url"):
+                avatar_html = f'<img class="account-avatar" src="{html_lib.escape(user["profile_image_url"])}" alt="">'
+            else:
+                avatar_html = '<div class="account-avatar account-avatar--fallback">👤</div>'
+            if user["is_admin"]:
+                badge_html = '<div class="account-badge account-badge--admin">🛡️ Admin</div>'
+            elif user["is_supporter"]:
+                badge_html = '<div class="account-badge account-badge--supporter">🧡 Supporter</div>'
+            else:
+                badge_html = ""
+            st.markdown(
+                f'<div class="account-card">{avatar_html}'
+                f'<div class="account-meta">'
+                f'<div class="account-name">{html_lib.escape(user["twitch_username"])}</div>'
+                f'{badge_html}</div></div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("🚪  Ausloggen", key="btn_logout", use_container_width=True):
                 token = st.session_state.get("session_token")
                 if token:
                     db.delete_session(token)
@@ -171,7 +178,7 @@ def render_login_gate() -> bool:
             login_url = twitch_auth.get_login_url()
             st.link_button("🟣 Mit Twitch anmelden", login_url, type="primary", use_container_width=True)
             st.caption("Login erforderlich, um die Tauschbörse zu nutzen.")
-        st.divider()
+        st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
 
     if not user:
         _render_center_login()
