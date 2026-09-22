@@ -37,6 +37,7 @@ import streamlit as st
 
 import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
+import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
 
 # ----------------------------------------------------------------------------
 # Konstanten
@@ -3100,6 +3101,23 @@ CSS = """
     .account-badge--admin { color: #60a5fa; }
     .account-badge--supporter { color: #fb923c; }
     .side-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0 14px 0; }
+
+    /* ---- Gold-Markierung für komplette Decks in „Mein Profil“ ---- */
+    .deck-marker { display: none; }
+    .deck-marker--complete + div[data-testid="stExpander"] details {
+        border: 1px solid #f5d90a !important; border-radius: 12px !important;
+        background: linear-gradient(90deg, rgba(245,217,10,0.14), rgba(245,217,10,0.03)) !important;
+        box-shadow: 0 0 16px -4px rgba(245,217,10,0.55) !important;
+    }
+    .deck-marker--complete + div[data-testid="stExpander"] summary {
+        background: linear-gradient(90deg, #fff7c2, #f5d90a 55%, #fff7c2) !important;
+        border-radius: 10px !important;
+    }
+    .deck-marker--complete + div[data-testid="stExpander"] summary p,
+    .deck-marker--complete + div[data-testid="stExpander"] summary span,
+    .deck-marker--complete + div[data-testid="stExpander"] summary svg {
+        color: #3a2e00 !important; fill: #3a2e00 !important; font-weight: 800 !important;
+    }
 </style>
 """
 
@@ -3316,13 +3334,15 @@ def render_offers(items: List[Dict[str, Any]]) -> None:
 
 
 def render_direct_matches(
-    matches: List[Dict[str, Any]], p1_label: str, p2_label: str
+    matches: List[Dict[str, Any]], p1_label: str, p2_label: str, user_id: Optional[int] = None
 ) -> None:
-    """Zeigt fertig zusammengestellte 1:1-Tauschgeschäfte im Tauschbörse-Design (BIETET → SUCHT)."""
+    """Zeigt fertig zusammengestellte 1:1-Tauschgeschäfte im Tauschbörse-Design (BIETET → SUCHT).
+    Ist `user_id` gesetzt, gibt es je Treffer einen „✅ Als getauscht markieren“-Button, der eine
+    Nachricht im „🔔 News“-Reiter des eingeloggten Nutzers hinterlegt."""
     if not matches:
         st.info("Aktuell kein direkt passendes Tauschgeschäft gefunden.")
         return
-    for m in matches:
+    for i, m in enumerate(matches):
         give, get = m["p1_gives"], m["p2_gives"]
         badge = RARITY_BADGE.get(m["rarity"], "badge-common")
         rarity_label = RARITY_LABEL_DE.get(m["rarity"], m["rarity"])
@@ -3339,6 +3359,15 @@ def render_direct_matches(
             f'</div></div>',
             unsafe_allow_html=True,
         )
+        if user_id is not None:
+            if st.button("✅ Als getauscht markieren", key=f"mark_direct_{i}_{give.get('id')}_{get.get('id')}",
+                        use_container_width=True):
+                notifications.add_notification(
+                    user_id,
+                    f"🔄 Tausch bestätigt: Du hast {html_lib.escape(give['name'])} gegen "
+                    f"{html_lib.escape(get['name'])} mit {html_lib.escape(p2_label)} getauscht.",
+                )
+                st.success("Als getauscht markiert – Nachricht wurde in deinen News gespeichert.")
 
 
 def render_open_offers(items: List[Dict[str, Any]], owner_label: str, other_label: str) -> None:
@@ -3546,8 +3575,15 @@ def render_my_profile_grid(my_inv: List[Dict[str, Any]]) -> None:
         cards = sorted(by_deck[deck_name], key=lambda c: c.get("slot", 0))
         owned = sum(1 for c in cards if c["count"] > 0)
         total = len(cards)
+        complete = total > 0 and owned == total
         streamer = next((c.get("streamer") for c in cards if c.get("streamer")), "")
-        title = f"{deck_name}" + (f" von {streamer}" if streamer else "") + f" · {owned}/{total}"
+        title = (
+            ("🏆 " if complete else "") + f"{deck_name}"
+            + (f" von {streamer}" if streamer else "") + f" · {owned}/{total}"
+            + (" · KOMPLETT ✨" if complete else "")
+        )
+        marker_class = "deck-marker deck-marker--complete" if complete else "deck-marker"
+        st.markdown(f'<div class="{marker_class}"></div>', unsafe_allow_html=True)
         with st.expander(title, expanded=False):
             parts = ['<div class="mycard-grid">']
             for c in cards:
@@ -3695,28 +3731,30 @@ def render_get_rid_tab(name_map: Dict[str, str], selected_rarities: List[str], u
         st.info("Du hast aktuell keine Dubletten, die du loswerden könntest.")
         return
 
-    q = st.text_input("Kartenname eingeben, den du loswerden willst",
-                      placeholder="z. B. Headset, Mikro, …", key="ridcard_query")
+    by_id_all = {c["id"]: c for c in my_dups}
+
+    def _label(cid: Optional[str]) -> str:
+        if cid is None:
+            return "— Karte auswählen —"
+        c = by_id_all[cid]
+        extra = f" · 🎥 {c['streamer']}" if c.get("streamer") else ""
+        return f"🔁 {c['name']} ×{c['count']} · {RARITY_LABEL_DE.get(c['rarity'], c['rarity'])} · {c.get('deck', '')}{extra}"
+
+    st.caption(f"Du hast {len(my_dups)} Dubletten – wähle direkt eine davon aus:")
+    with st.expander("🔍 Optional: nach Namen filtern", expanded=False):
+        q = st.text_input("Kartenname filtern", placeholder="z. B. Headset, Mikro, …",
+                          key="ridcard_query", label_visibility="collapsed")
+
     tokens = [t for t in re.split(r"\s+", q.lower().strip()) if t]
     shown = [c for c in my_dups
              if all(t in f'{c["name"]} {c.get("deck", "")} {c.get("streamer", "")}'.lower() for t in tokens)]
-    if not tokens:
-        st.caption(f"Du hast {len(my_dups)} Dubletten. Tippe oben einen Namen, um zu filtern.")
     if not shown:
         st.info("Keine deiner Dubletten passt zu dieser Suche.")
         return
 
     by_id = {c["id"]: c for c in shown}
 
-    def _label(cid: Optional[str]) -> str:
-        if cid is None:
-            return "— Karte auswählen —"
-        c = by_id[cid]
-        extra = f" · 🎥 {c['streamer']}" if c.get("streamer") else ""
-        return f"🔁 {c['name']} ×{c['count']} · {RARITY_LABEL_DE.get(c['rarity'], c['rarity'])} · {c.get('deck', '')}{extra}"
-
-    pick = st.selectbox("Karte wählen", [None] + list(by_id), format_func=_label, key="ridcard_pick",
-                        label_visibility="collapsed")
+    pick = st.selectbox("Karte wählen", [None] + list(by_id), format_func=_label, key="ridcard_pick")
     if pick is None:
         return
 
@@ -3744,11 +3782,24 @@ def render_get_rid_tab(name_map: Dict[str, str], selected_rarities: List[str], u
         counters = r["counters"]
         st.markdown(f"**✅ 👤 {html_lib.escape(r['label'])}** · braucht diese Karte · "
                     f"**{len(counters)}** mögliche Gegenkarte(n) von {html_lib.escape(r['label'])}")
-        cards_html = [_trade_card_html(me_label, r["label"], give, c, rarity) for c in counters]
-        st.markdown("".join(cards_html[:3]), unsafe_allow_html=True)
-        if len(cards_html) > 3:
-            with st.expander(f"Weitere {len(cards_html) - 3} Tauschmöglichkeiten mit {r['label']}"):
-                st.markdown("".join(cards_html[3:]), unsafe_allow_html=True)
+
+        def _render_counter(c: Dict[str, Any], idx: int) -> None:
+            st.markdown(_trade_card_html(me_label, r["label"], give, c, rarity), unsafe_allow_html=True)
+            if st.button("✅ Als getauscht markieren", key=f"mark_rid_{card['id']}_{c['id']}_{idx}",
+                        use_container_width=True):
+                notifications.add_notification(
+                    user["id"],
+                    f"🔄 Tausch bestätigt: Du hast {html_lib.escape(card['name'])} gegen "
+                    f"{html_lib.escape(c['name'])} mit {html_lib.escape(r['label'])} getauscht.",
+                )
+                st.success("Als getauscht markiert – Nachricht wurde in deinen News gespeichert.")
+
+        for idx, c in enumerate(counters[:3]):
+            _render_counter(c, idx)
+        if len(counters) > 3:
+            with st.expander(f"Weitere {len(counters) - 3} Tauschmöglichkeiten mit {r['label']}"):
+                for idx, c in enumerate(counters[3:], start=3):
+                    _render_counter(c, idx)
     if no_offer:
         st.warning(f"{len(no_offer)} Profil(e) brauchen diese Karte, aber du hast aktuell keine passende "
                    f"Gegenkarte ({rarity_label}), die ihnen fehlt: " + ", ".join(no_offer))
@@ -4505,7 +4556,7 @@ def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], use
     st.divider()
     st.subheader(f"🤝 Direkte Treffer – {p1_label} ⇄ {p2_label}")
     st.caption("Diese Tausche sind sofort möglich: jede Seite besitzt die vom anderen gesuchte Karte als Dublette.")
-    render_direct_matches(matches, p1_label, p2_label)
+    render_direct_matches(matches, p1_label, p2_label, user_id=user["id"])
 
     st.divider()
     t1, t2 = st.columns(2)
@@ -4537,12 +4588,62 @@ def render_admin_tab(name_map: Dict[str, str]) -> None:
     render_admin_panel(name_map)
 
 
+def render_news_tab(user: Dict[str, Any]) -> None:
+    """Bereich „🔔 News“: zeigt alle Tausch-Benachrichtigungen des eingeloggten Nutzers –
+    eine Nachricht landet hier, sobald irgendwo ein Tausch per „✅ Als getauscht markieren“
+    bestätigt wurde."""
+    st.markdown('<div class="section-title">🔔 News</div>', unsafe_allow_html=True)
+    items = notifications.get_notifications(user["id"])
+    unread = [n for n in items if not n["is_read"]]
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="panel-hint">{len(unread)} ungelesen von {len(items)} Nachrichten insgesamt.</div>',
+        unsafe_allow_html=True,
+    )
+    if unread and st.button("✅ Alle als gelesen markieren", key="news_mark_all"):
+        notifications.mark_all_read(user["id"])
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not items:
+        st.info("Noch keine Nachrichten. Sobald du einen Tausch mit „✅ Als getauscht markieren“ "
+                 "bestätigst, taucht er hier auf.")
+        return
+
+    for n in items:
+        ts = n["created_at"].replace("T", " ")
+        if n["is_read"]:
+            st.markdown(
+                f'<div class="trade-card" style="opacity:0.6;">'
+                f'<div class="trade-meta" style="text-align:left; flex:1;">'
+                f'<span class="trade-count">{html_lib.escape(ts)}</span><br/>'
+                f'<span class="trade-owner">{n["message"]}</span></div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            col_msg, col_btn = st.columns([5, 1])
+            with col_msg:
+                st.markdown(
+                    f'<div class="trade-card" style="border-color:#7c3aed;">'
+                    f'<div class="trade-meta" style="text-align:left; flex:1;">'
+                    f'<span class="trade-count">{html_lib.escape(ts)} · 🔔 neu</span><br/>'
+                    f'<span class="trade-owner">{n["message"]}</span></div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_btn:
+                if st.button("✓", key=f"news_read_{n['id']}", help="Als gelesen markieren"):
+                    notifications.mark_read(n["id"])
+                    st.rerun()
+
+
 SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
     ("MENÜ", [
         ("profile", "👤", "Mein Profil"),
         ("search", "🔍", "Meine fehlende Karten"),
         ("getrid", "🎯", "Karte loswerden"),
         ("trade", "🔄", "1:1 Tausch"),
+        ("news", "🔔", "News"),
     ]),
 ]
 SIDEBAR_PAGE_LABELS: Dict[str, str] = {
@@ -4550,6 +4651,7 @@ SIDEBAR_PAGE_LABELS: Dict[str, str] = {
     "search": "🔍 Meine fehlende Karten",
     "getrid": "🎯 Karte loswerden",
     "trade": "🔄 1:1 Tausch",
+    "news": "🔔 News",
     "admin": "🛠️ Admin",
 }
 
@@ -4564,12 +4666,15 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = groups[0][1][0][0]
 
+    unread = notifications.unread_count(user["id"])
+
     for label, items in groups:
         st.markdown(f'<div class="side-nav-label">{label}</div>', unsafe_allow_html=True)
         for key, icon, text in items:
             active = st.session_state["current_page"] == key
+            btn_label = f"{icon}  {text}" + (f"  ({unread})" if key == "news" and unread else "")
             if st.button(
-                f"{icon}  {text}", key=f"nav_{key}", use_container_width=True,
+                btn_label, key=f"nav_{key}", use_container_width=True,
                 type="primary" if active else "secondary",
             ):
                 st.session_state["current_page"] = key
@@ -4598,6 +4703,7 @@ def main() -> None:
     if not auth_ui.render_login_gate():
         return
 
+    notifications.init_db()
     user = st.session_state["auth_user"]
 
     name_map = load_name_map()
@@ -4606,31 +4712,8 @@ def main() -> None:
     with st.sidebar:
         page = render_sidebar_nav(user)
 
-    # ---- Toolbar: Seltenheiten-Filter – gilt nur für die Tauschbörse-Bereiche, nicht für
-    # „Mein Profil“ und nicht für „Admin“ (dort gibt es keine Kartenliste, die gefiltert werden könnte). ----
+    # ---- Keine Seltenheiten-Filter-Toolbar mehr: alle Seltenheiten werden immer angezeigt. ----
     selected_rarities: List[str] = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
-    if page not in ("👤 Mein Profil", "🛠️ Admin"):
-        with st.container():
-            st.markdown('<div class="panel">', unsafe_allow_html=True)
-            st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
-            selected_rarities = st.multiselect(
-                "Seltenheiten filtern", options=selected_rarities, default=selected_rarities,
-                format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
-            )
-            with st.expander("ℹ️ Funktionsweise"):
-                st.markdown(
-                    "1. **🔍 Meine fehlende Karten:** Zeigt, welche deiner fehlenden Karten du 1:1 gegen eine "
-                    "Dublette tauschen kannst, und findet dazu passende Partner aus deinen gespeicherten Profilen.\n"
-                    "2. **🎯 Karte loswerden:** Kartennamen eingeben, den du loswerden willst – die App sucht, "
-                    "wem diese Karte fehlt und was er dir im Gegenzug anbieten kann.\n"
-                    "3. **🔄 1:1 Tausch:** Dein Profil ist automatisch Spieler 1 – wähle Spieler 2 (oder einen "
-                    "Favoriten ⭐) und vergleiche.\n"
-                    "4. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
-                    "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
-                    "5. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
-                    "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥)."
-                )
-            st.markdown('</div>', unsafe_allow_html=True)
 
     if page == "👤 Mein Profil":
         render_my_profile_page(user)
@@ -4640,6 +4723,8 @@ def main() -> None:
         render_get_rid_tab(name_map, selected_rarities, user)
     elif page == "🔄 1:1 Tausch":
         render_trade_tab(name_map, selected_rarities, user)
+    elif page == "🔔 News":
+        render_news_tab(user)
     elif page == "🛠️ Admin":
         render_admin_tab(name_map)
 
