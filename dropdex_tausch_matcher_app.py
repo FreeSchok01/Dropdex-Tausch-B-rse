@@ -2866,6 +2866,20 @@ CSS = """
         height: 0 !important;
     }
 
+    /* ---- Sidebar-Öffnen-Button (Pfeil) sichtbar lassen ----
+       Der Button sitzt normalerweise in der oben ausgeblendeten Kopfleiste.
+       Ohne diese Regel verschwindet er mit -> zugeklappte Sidebar lässt sich
+       nicht mehr öffnen. Wir holen ihn per fixed-Position wieder sichtbar. */
+    div[data-testid="stSidebarCollapsedControl"] {
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        position: fixed !important;
+        top: 0.6rem !important;
+        left: 0.6rem !important;
+        z-index: 999999 !important;
+    }
+
     .stApp {
         background: transparent;
         color: #e7e7ef;
