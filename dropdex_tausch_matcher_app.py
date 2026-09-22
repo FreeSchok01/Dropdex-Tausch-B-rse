@@ -3921,6 +3921,8 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
     """Admin-Bereich (passwortgeschützt): viele Profile (Name + URL) auf einmal hinzufügen, löschen,
     sichern. Alles landet dauerhaft in dropdex_namen.json und steht danach überall als Auswahl/Partner bereit."""
     with st.expander("🔐 Admin · Profile verwalten", expanded=False):
+        st.markdown(auth_ui.ADMIN_CSS, unsafe_allow_html=True)
+
         pw = get_admin_password()
         if not pw:
             st.info(
@@ -3930,9 +3932,15 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
             )
             st.code('ADMIN_PASSWORD = "dein-passwort"', language="toml")
             return
+
         if not st.session_state.get("is_admin"):
-            entered = st.text_input("Admin-Passwort", type="password", key="admin_pw")
-            if st.button("Anmelden", key="admin_login"):
+            st.markdown('<div class="admin-detail-card">', unsafe_allow_html=True)
+            st.markdown('<div style="font-size:2rem;">🔐</div>', unsafe_allow_html=True)
+            st.markdown('<div class="admin-detail-name">Profile verwalten</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            entered = st.text_input("Admin-Passwort", type="password", key="admin_pw", label_visibility="collapsed",
+                                     placeholder="🔑 Admin-Passwort")
+            if st.button("Anmelden", key="admin_login", type="primary", use_container_width=True):
                 if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
                     st.session_state["is_admin"] = True
                     st.rerun()
@@ -3940,86 +3948,141 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
                     st.error("Falsches Passwort.")
             return
 
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown(f"**{len(name_map)}** Profile gespeichert.")
-        with c2:
-            if st.button("Abmelden", key="admin_logout"):
+        nav_col, list_col = st.columns([1, 3.3])
+
+        with nav_col:
+            st.markdown('<div class="admin-nav-title">Bereich</div>', unsafe_allow_html=True)
+            st.button("👥 Profile", key="admin_nav_profiles_noop", use_container_width=True,
+                      type="primary", disabled=True)
+            if st.button("↩️ Abmelden", key="admin_logout", use_container_width=True):
                 st.session_state["is_admin"] = False
                 st.rerun()
 
-        msg = st.session_state.pop("admin_msg", None)
-        if msg:
-            if not msg.get("saved", True):
-                st.error("Speichern fehlgeschlagen (Schreibrechte?). Die Änderungen sind nur bis zum Neustart aktiv.")
-            elif "deleted" in msg:
-                st.success(f"{msg['deleted']} Profil(e) gelöscht.")
-            elif msg.get("n"):
-                st.success(f"{msg.get('new', 0)} neu hinzugefügt, {msg.get('upd', 0)} aktualisiert.")
-            for e in msg.get("errors", []):
-                st.warning(e)
-
-        st.markdown("**Profile hinzufügen** – pro Zeile ein Profil: Name und URL (oder nur die User-ID). "
-                    "Gleiche URL = Name wird aktualisiert.")
-        st.text_area(
-            "Profile", key="admin_bulk", height=170, label_visibility="collapsed",
-            placeholder="ETS2Chaoten | https://dropdex.de/de/u/cmt39st0b02xtigydjkep2cxl\n"
-                        "@AnderesProfil | cmt1o16wx001lx4ydnczju2ch",
-        )
-        entries, _ = parse_profile_lines(st.session_state.get("admin_bulk", ""))
-        st.button(f"➕ Hinzufügen / aktualisieren ({len(entries)} erkannt)", key="admin_add",
-                  type="primary", on_click=_admin_add_profiles, disabled=not st.session_state.get("admin_bulk", "").strip())
-
-        with st.expander("🔎 Profile aus einer Profilseite auslesen"):
-            st.caption("Liest alle Profil-Links (Streamer/Nutzer, die auf der Seite verlinkt sind) samt Name und "
-                       "User-ID aus einer Profilseite und gibt sie als „Name  ID“ aus.")
-            scan_url = st.text_input("Profil-URL", placeholder="https://dropdex.de/de/u/…", key="admin_scan_url")
-            if st.button("🔎 Auslesen", key="admin_scan_btn", disabled=not scan_url.strip()):
-                try:
-                    st.session_state["admin_scan_result"] = extract_profile_links(fetch_page(normalize_url(scan_url)))
-                except Exception as e:  # noqa: BLE001
-                    st.session_state["admin_scan_result"] = []
-                    st.error(f"Seite konnte nicht geladen werden: {e}")
-            found = st.session_state.get("admin_scan_result")
-            if found is not None and st.session_state.get("admin_scan_url", "").strip():
-                if not found:
-                    st.warning("Keine Profil-Links gefunden. Evtl. sind die Streamer dort nicht verlinkt – "
-                               "dann speichere die Seite (Strg+S) und schick mir die .html-Datei.")
-                else:
-                    st.code("\n".join(f"{n or '???'}  {u}" for n, u in found))
-                    st.button(f"⬆️ {len(found)} Einträge ins Feld oben übernehmen", key="admin_scan_take",
-                              on_click=_admin_append_scan)
-
-        if name_map:
-            st.markdown("**Gespeicherte Profile**")
-            st.dataframe(pd.DataFrame(
-                [{"Name": n, "URL": u} for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())]
-            ), hide_index=True)
-            st.multiselect(
-                "Profile löschen", options=sorted(name_map, key=lambda u: name_map[u].lower()),
-                format_func=lambda u: f"{name_map[u]}  ·  {u}", key="admin_delete",
+        with list_col:
+            st.markdown(
+                f'<div class="admin-header-row"><h3>Öffentliche Profile</h3>'
+                f'<span class="admin-count">{len(name_map)} gesamt</span></div>',
+                unsafe_allow_html=True,
             )
-            st.button("🗑️ Ausgewählte löschen", key="admin_del_btn", on_click=_admin_delete_profiles,
-                      disabled=not st.session_state.get("admin_delete"))
 
-            with st.expander("💾 Backup & Export"):
-                st.caption(
-                    "Gespeichert wird in `dropdex_namen.json` neben der App. Bei Hostern mit flüchtigem Speicher "
-                    "(z. B. manche Cloud-Dienste) kann die Datei bei einem Neustart zurückgesetzt werden – dann die "
-                    "Code-Vorlage unten in `DEFAULT_PROFILES` einfügen oder das Backup wieder einspielen."
+            msg = st.session_state.pop("admin_msg", None)
+            if msg:
+                if not msg.get("saved", True):
+                    st.error("Speichern fehlgeschlagen (Schreibrechte?). Die Änderungen sind nur bis zum Neustart aktiv.")
+                elif "deleted" in msg:
+                    st.success(f"{msg['deleted']} Profil(e) gelöscht.")
+                elif msg.get("n"):
+                    st.success(f"{msg.get('new', 0)} neu hinzugefügt, {msg.get('upd', 0)} aktualisiert.")
+                for e in msg.get("errors", []):
+                    st.warning(e)
+
+            with st.expander("➕ Profile hinzufügen", expanded=not name_map):
+                st.caption("Pro Zeile ein Profil: Name und URL (oder nur die User-ID). "
+                           "Gleiche URL = Name wird aktualisiert.")
+                st.text_area(
+                    "Profile", key="admin_bulk", height=170, label_visibility="collapsed",
+                    placeholder="ETS2Chaoten | https://dropdex.de/de/u/cmt39st0b02xtigydjkep2cxl\n"
+                                "@AnderesProfil | cmt1o16wx001lx4ydnczju2ch",
                 )
-                st.download_button("📥 Backup (JSON) herunterladen",
-                                   json.dumps(name_map, ensure_ascii=False, indent=2, sort_keys=True),
-                                   "dropdex_namen.json", "application/json", key="admin_dl")
-                st.file_uploader("Backup einspielen", type=["json"], key="admin_upload")
-                st.button("📤 Backup einspielen", key="admin_restore", on_click=_admin_restore_backup,
-                          disabled=st.session_state.get("admin_upload") is None)
-                st.markdown("Liste zum Kopieren (Name | URL):")
-                st.code("\n".join(f"{n} | {u}" for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())))
-                st.markdown("Code-Vorlage für `DEFAULT_PROFILES`:")
-                st.code("DEFAULT_PROFILES = {\n" + "".join(
-                    f"    {json.dumps(u)}: {json.dumps(n, ensure_ascii=False)},\n"
-                    for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
+                entries, _ = parse_profile_lines(st.session_state.get("admin_bulk", ""))
+                st.button(f"➕ Hinzufügen / aktualisieren ({len(entries)} erkannt)", key="admin_add",
+                          type="primary", on_click=_admin_add_profiles,
+                          disabled=not st.session_state.get("admin_bulk", "").strip())
+
+                st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+                st.markdown("**🔎 Profile aus einer Profilseite auslesen**")
+                st.caption("Liest alle Profil-Links (Streamer/Nutzer, die auf der Seite verlinkt sind) samt Name und "
+                           "User-ID aus einer Profilseite und gibt sie als „Name  ID“ aus.")
+                scan_url = st.text_input("Profil-URL", placeholder="https://dropdex.de/de/u/…", key="admin_scan_url")
+                if st.button("🔎 Auslesen", key="admin_scan_btn", disabled=not scan_url.strip()):
+                    try:
+                        st.session_state["admin_scan_result"] = extract_profile_links(fetch_page(normalize_url(scan_url)))
+                    except Exception as e:  # noqa: BLE001
+                        st.session_state["admin_scan_result"] = []
+                        st.error(f"Seite konnte nicht geladen werden: {e}")
+                found = st.session_state.get("admin_scan_result")
+                if found is not None and st.session_state.get("admin_scan_url", "").strip():
+                    if not found:
+                        st.warning("Keine Profil-Links gefunden. Evtl. sind die Streamer dort nicht verlinkt – "
+                                   "dann speichere die Seite (Strg+S) und schick mir die .html-Datei.")
+                    else:
+                        st.code("\n".join(f"{n or '???'}  {u}" for n, u in found))
+                        st.button(f"⬆️ {len(found)} Einträge ins Feld oben übernehmen", key="admin_scan_take",
+                                  on_click=_admin_append_scan)
+
+            if not name_map:
+                st.markdown('<div class="admin-empty">Noch keine Profile gespeichert.</div>', unsafe_allow_html=True)
+            else:
+                search = st.text_input(
+                    "Profile suchen", key="admin_profile_search", placeholder="🔍 Profil suchen …",
+                    label_visibility="collapsed",
+                )
+                rows = sorted(name_map.items(), key=lambda kv: kv[1].lower())
+                if search.strip():
+                    needle = search.strip().lower()
+                    rows = [(u, n) for u, n in rows if needle in n.lower() or needle in u.lower()]
+
+                if not rows:
+                    st.markdown('<div class="admin-empty">Keine Treffer.</div>', unsafe_allow_html=True)
+                else:
+                    page_size = 10
+                    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+                    page = min(st.session_state.get("admin_profile_page", 1), total_pages)
+                    start = (page - 1) * page_size
+                    page_rows = rows[start:start + page_size]
+
+                    for url, nm in page_rows:
+                        c_name, c_del = st.columns([5, 0.8])
+                        with c_name:
+                            st.markdown(
+                                f'<div class="admin-row"><div>'
+                                f'<div class="admin-name">{html_lib.escape(nm)}</div>'
+                                f'<div class="admin-sub">{html_lib.escape(url)}</div>'
+                                f'</div></div>',
+                                unsafe_allow_html=True,
+                            )
+                        with c_del:
+                            if st.button("🗑️", key=f"admin_del_{url}", help="Profil löschen"):
+                                st.session_state["admin_delete"] = [url]
+                                _admin_delete_profiles()
+                                st.rerun()
+
+                    if total_pages > 1:
+                        p_prev, p_info, p_next = st.columns([1, 3, 1])
+                        with p_prev:
+                            if st.button("‹", key="admin_profile_page_prev", disabled=page <= 1, use_container_width=True):
+                                st.session_state["admin_profile_page"] = page - 1
+                                st.rerun()
+                        with p_info:
+                            st.markdown(
+                                f'<div style="text-align:center; color:#8b8d9e; font-size:0.82rem; padding-top:6px;">'
+                                f'Zeige {start + 1}–{min(start + page_size, len(rows))} von {len(rows)}'
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with p_next:
+                            if st.button("›", key="admin_profile_page_next", disabled=page >= total_pages, use_container_width=True):
+                                st.session_state["admin_profile_page"] = page + 1
+                                st.rerun()
+
+                with st.expander("💾 Backup & Export"):
+                    st.caption(
+                        "Gespeichert wird in `dropdex_namen.json` neben der App. Bei Hostern mit flüchtigem Speicher "
+                        "(z. B. manche Cloud-Dienste) kann die Datei bei einem Neustart zurückgesetzt werden – dann die "
+                        "Code-Vorlage unten in `DEFAULT_PROFILES` einfügen oder das Backup wieder einspielen."
+                    )
+                    st.download_button("📥 Backup (JSON) herunterladen",
+                                       json.dumps(name_map, ensure_ascii=False, indent=2, sort_keys=True),
+                                       "dropdex_namen.json", "application/json", key="admin_dl")
+                    st.file_uploader("Backup einspielen", type=["json"], key="admin_upload")
+                    st.button("📤 Backup einspielen", key="admin_restore", on_click=_admin_restore_backup,
+                              disabled=st.session_state.get("admin_upload") is None)
+                    st.markdown("Liste zum Kopieren (Name | URL):")
+                    st.code("\n".join(f"{n} | {u}" for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())))
+                    st.markdown("Code-Vorlage für `DEFAULT_PROFILES`:")
+                    st.code("DEFAULT_PROFILES = {\n" + "".join(
+                        f"    {json.dumps(u)}: {json.dumps(n, ensure_ascii=False)},\n"
+                        for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
 
 
 def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
