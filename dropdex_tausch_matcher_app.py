@@ -38,6 +38,8 @@ import streamlit as st
 import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
+import trade_watch  # beobachtet das eigene Profil alle 10s auf verschwundene Karten (siehe trade_watch.py)
+import streamlit.components.v1 as components
 
 # ----------------------------------------------------------------------------
 # Konstanten
@@ -4683,6 +4685,23 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
     return SIDEBAR_PAGE_LABELS[st.session_state["current_page"]]
 
 
+def render_auto_refresh() -> None:
+    """Lädt die Seite alle `trade_watch.CHECK_INTERVAL_SECONDS` Sekunden automatisch neu
+    (per kleinem JS-Timer in einem unsichtbaren Komponenten-Frame). So läuft bei jedem
+    Reload auch der Hintergrund-Check in trade_watch.maybe_check() erneut an – ganz ohne
+    zusätzliche Bibliothek."""
+    components.html(
+        f"""
+        <script>
+        setTimeout(function() {{
+            window.parent.location.reload();
+        }}, {trade_watch.CHECK_INTERVAL_SECONDS * 1000});
+        </script>
+        """,
+        height=0,
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Tauschbörse · Dropdex Matcher",
@@ -4704,7 +4723,15 @@ def main() -> None:
         return
 
     notifications.init_db()
+    trade_watch.init_db()
     user = st.session_state["auth_user"]
+
+    # ---- Alle 10s: Seite neu laden + im Hintergrund prüfen, ob eine Karte aus dem eigenen
+    # Profil verschwunden ist (= erfolgreich getauscht) -> Nachricht landet automatisch in "🔔 News". ----
+    render_auto_refresh()
+    own_url = (user.get("own_profile_url") or "").strip()
+    if own_url:
+        trade_watch.maybe_check(user["id"], lambda: load_my_full_profile(own_url))
 
     name_map = load_name_map()
 
