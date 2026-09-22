@@ -3038,6 +3038,34 @@ CSS = """
     }
     label, .stCheckbox label, .stToggle label { color: #c7c8dc !important; }
     hr { border-color: #232538 !important; }
+
+    /* ---- Sidebar-Navigation (Gruppenlabel + Pill-Buttons, wie im Referenz-Screenshot) ---- */
+    .side-nav-label {
+        font-size: 0.7rem; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase;
+        color: #6f7188; margin: 20px 6px 8px 6px;
+    }
+    .side-nav-label:first-of-type { margin-top: 4px; }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] { margin-bottom: 2px; }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        width: 100%; display: flex; align-items: center; justify-content: flex-start; gap: 10px;
+        text-align: left; background: transparent !important; border: none !important;
+        box-shadow: none !important; color: #b7b9cf !important; font-weight: 600 !important;
+        padding: 10px 14px !important; border-radius: 12px !important; font-size: 0.92rem !important;
+        transition: background 0.15s ease, color 0.15s ease;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button p {
+        font-size: 0.92rem !important; font-weight: inherit !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button:hover {
+        background: rgba(255,255,255,0.06) !important; color: #e7e7ef !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"] {
+        background: linear-gradient(90deg, #9333ea, #6366f1) !important; color: #fff !important;
+        box-shadow: 0 4px 14px rgba(124,58,237,0.45) !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"]:hover {
+        filter: brightness(1.08);
+    }
 </style>
 """
 
@@ -4475,6 +4503,47 @@ def render_admin_tab(name_map: Dict[str, str]) -> None:
     render_admin_panel(name_map)
 
 
+SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
+    ("MENÜ", [
+        ("profile", "👤", "Mein Profil"),
+        ("search", "🔍", "Meine fehlende Karten"),
+        ("getrid", "🎯", "Karte loswerden"),
+        ("trade", "🔄", "1:1 Tausch"),
+    ]),
+]
+SIDEBAR_PAGE_LABELS: Dict[str, str] = {
+    "profile": "👤 Mein Profil",
+    "search": "🔍 Meine fehlende Karten",
+    "getrid": "🎯 Karte loswerden",
+    "trade": "🔄 1:1 Tausch",
+    "admin": "🛠️ Admin",
+}
+
+
+def render_sidebar_nav(user: Dict[str, Any]) -> str:
+    """Baut die linke Navigation als Gruppenlabel + Icon-Pills (aktiver Eintrag = Lila-Verlauf).
+    Gibt das Label der aktuell gewählten Seite zurück (kompatibel zum bisherigen `page`-String)."""
+    groups = list(SIDEBAR_NAV_GROUPS)
+    if user.get("is_admin") or user.get("is_supporter"):
+        groups.append(("ADMIN", [("admin", "🛠️", "Admin")]))
+
+    if "current_page" not in st.session_state:
+        st.session_state["current_page"] = groups[0][1][0][0]
+
+    for label, items in groups:
+        st.markdown(f'<div class="side-nav-label">{label}</div>', unsafe_allow_html=True)
+        for key, icon, text in items:
+            active = st.session_state["current_page"] == key
+            if st.button(
+                f"{icon}  {text}", key=f"nav_{key}", use_container_width=True,
+                type="primary" if active else "secondary",
+            ):
+                st.session_state["current_page"] = key
+                st.rerun()
+
+    return SIDEBAR_PAGE_LABELS[st.session_state["current_page"]]
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Tauschbörse · Dropdex Matcher",
@@ -4499,13 +4568,10 @@ def main() -> None:
 
     name_map = load_name_map()
 
-    # ---- Navigation links (Sidebar) ----
-    nav_options = ["👤 Mein Profil", "🔍 Meine fehlende Karten", "🎯 Karte loswerden", "🔄 1:1 Tausch"]
-    if user.get("is_admin") or user.get("is_supporter"):
-        nav_options.append("🛠️ Admin")
+    # ---- Navigation links (Sidebar), im Stil: Gruppenlabel + Icon-Pills ----
     with st.sidebar:
         st.divider()
-        page = st.radio("📍 Bereich", nav_options, key="nav_page")
+        page = render_sidebar_nav(user)
 
     # ---- Toolbar: Seltenheiten-Filter – gilt nur für die Tauschbörse-Bereiche, nicht für
     # „Mein Profil“ (dort werden immer ALLE Karten des eigenen Profils angezeigt, wie auf dropdex.de). ----
