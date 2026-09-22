@@ -28,6 +28,8 @@ import html as html_lib
 import json
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3806,25 +3808,8 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
         st.button(f"➕ Hinzufügen / aktualisieren ({len(entries)} erkannt)", key="admin_add",
                   type="primary", on_click=_admin_add_profiles, disabled=not st.session_state.get("admin_bulk", "").strip())
 
-        with st.expander("🔎 Profile aus einer Profilseite auslesen"):
-            st.caption("Liest alle Profil-Links (Streamer/Nutzer, die auf der Seite verlinkt sind) samt Name und "
-                       "User-ID aus einer Profilseite und gibt sie als „Name  ID“ aus.")
-            scan_url = st.text_input("Profil-URL", placeholder="https://dropdex.de/de/u/…", key="admin_scan_url")
-            if st.button("🔎 Auslesen", key="admin_scan_btn", disabled=not scan_url.strip()):
-                try:
-                    st.session_state["admin_scan_result"] = extract_profile_links(fetch_page(normalize_url(scan_url)))
-                except Exception as e:  # noqa: BLE001
-                    st.session_state["admin_scan_result"] = []
-                    st.error(f"Seite konnte nicht geladen werden: {e}")
-            found = st.session_state.get("admin_scan_result")
-            if found is not None and st.session_state.get("admin_scan_url", "").strip():
-                if not found:
-                    st.warning("Keine Profil-Links gefunden. Evtl. sind die Streamer dort nicht verlinkt – "
-                               "dann speichere die Seite (Strg+S) und schick mir die .html-Datei.")
-                else:
-                    st.code("\n".join(f"{n or '???'}  {u}" for n, u in found))
-                    st.button(f"⬆️ {len(found)} Einträge ins Feld oben übernehmen", key="admin_scan_take",
-                              on_click=_admin_append_scan)
+        st.caption("🔎 Der Scan-Werkzeug (Profile aus einer Profilseite auslesen) ist jetzt ein eigener "
+                   "Reiter „🔎 Scan“ links in der Navigation.")
 
         if name_map:
             st.markdown("**Gespeicherte Profile**")
@@ -3858,6 +3843,102 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
                     for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
 
 
+# Ein einziger, wiederverwendeter Thread-Pool für den Scan-Vorgang (läuft im Hintergrund,
+# damit die Oberfläche per "Abbrechen"-Button sofort wieder frei wird, statt beim Laden
+# der Seite einzufrieren).
+_SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
+
+def render_scan_tool() -> None:
+    """🔎 Scan (eigener Reiter): liest alle Profil-Links von einer Dropdex-Profilseite aus.
+
+    War früher Teil von "Admin · Profile verwalten" (Scan-Unterpunkt), jetzt eigenständiger
+    Reiter mit Abbrechen-Button, da das Laden der Seite ein paar Sekunden dauern kann.
+    Hinweis: "Abbrechen" gibt die Oberfläche sofort frei, der Hintergrund-Request läuft
+    technisch weiter (ein laufender HTTP-Request lässt sich nicht hart unterbrechen) -
+    sein Ergebnis wird aber verworfen.
+    """
+    st.markdown('<div class="section-title">🔎 Scan</div>', unsafe_allow_html=True)
+
+    pw = get_admin_password()
+    if not pw:
+        st.info(
+            "Der Admin-Zugang ist noch nicht eingerichtet. Lege ein Passwort fest – lokal in der Datei "
+            "`.streamlit/secrets.toml` (oder als Umgebungsvariable `DROPDEX_ADMIN_PASSWORD`), auf "
+            "Streamlit Cloud unter *Settings → Secrets*:"
+        )
+        st.code('ADMIN_PASSWORD = "dein-passwort"', language="toml")
+        return
+    if not st.session_state.get("is_admin"):
+        entered = st.text_input("Admin-Passwort", type="password", key="scan_pw")
+        if st.button("Anmelden", key="scan_login"):
+            if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
+                st.session_state["is_admin"] = True
+                st.rerun()
+            else:
+                st.error("Falsches Passwort.")
+        return
+
+    st.caption("Liest alle Profil-Links (Streamer/Nutzer, die auf der Seite verlinkt sind) samt Name und "
+               "User-ID aus einer Profilseite aus und gibt sie als „Name  ID“ aus.")
+
+    running = st.session_state.get("admin_scan_running", False)
+    scan_url = st.text_input("Profil-URL", placeholder="https://dropdex.de/de/u/…",
+                              key="admin_scan_url", disabled=running)
+
+    col_start, col_cancel = st.columns([3, 1])
+    with col_start:
+        start_clicked = st.button("🔎 Auslesen", key="admin_scan_btn",
+                                   disabled=running or not scan_url.strip())
+    with col_cancel:
+        cancel_clicked = st.button("✖ Abbrechen", key="admin_scan_cancel_btn", disabled=not running)
+
+    if start_clicked and not running:
+        st.session_state["admin_scan_running"] = True
+        st.session_state["admin_scan_cancelled"] = False
+        st.session_state["admin_scan_result"] = None
+        st.session_state["admin_scan_future"] = _SCAN_EXECUTOR.submit(
+            lambda u=scan_url: extract_profile_links(fetch_page(normalize_url(u)))
+        )
+        st.rerun()
+
+    if cancel_clicked and running:
+        st.session_state["admin_scan_running"] = False
+        st.session_state["admin_scan_cancelled"] = True
+        st.session_state["admin_scan_future"] = None
+        st.rerun()
+
+    future = st.session_state.get("admin_scan_future")
+    if st.session_state.get("admin_scan_running") and future is not None:
+        if future.done():
+            st.session_state["admin_scan_running"] = False
+            try:
+                st.session_state["admin_scan_result"] = future.result()
+            except Exception as e:  # noqa: BLE001
+                st.session_state["admin_scan_result"] = []
+                st.error(f"Seite konnte nicht geladen werden: {e}")
+            st.rerun()
+        else:
+            st.info("⏳ Lese Profilseite aus … (jederzeit über „Abbrechen“ stoppbar)")
+            time.sleep(0.4)
+            st.rerun()
+        return
+
+    if st.session_state.get("admin_scan_cancelled"):
+        st.warning("Scan abgebrochen.")
+
+    found = st.session_state.get("admin_scan_result")
+    if found is not None:
+        if not found:
+            st.warning("Keine Profil-Links gefunden. Evtl. sind die Streamer dort nicht verlinkt – "
+                       "dann speichere die Seite (Strg+S) und schick mir die .html-Datei.")
+        else:
+            st.code("\n".join(f"{n or '???'}  {u}" for n, u in found))
+            st.button(f"⬆️ {len(found)} Einträge ins Admin-Textfeld übernehmen", key="admin_scan_take",
+                      on_click=_admin_append_scan)
+            st.caption("Die Einträge landen im Textfeld auf dem Reiter „🛠️ Admin“ → „Profile hinzufügen“.")
+
+
 def main() -> None:
     st.set_page_config(page_title="Tauschbörse · Dropdex Matcher", page_icon="🔄", layout="wide")
     st.markdown(CSS.replace("%%BG_IMAGE_DATA_URI%%", f"data:image/jpeg;base64,{BG_IMAGE_B64}"), unsafe_allow_html=True)
@@ -3876,42 +3957,64 @@ def main() -> None:
     if not auth_ui.render_login_gate():
         return
 
-    # ---- Admin-Dashboard (nur sichtbar für is_admin == True) ----
-    auth_ui.render_admin_dashboard()
-
-    # ---- Toolbar: Seltenheiten-Filter (oben, keine Sidebar) ----
-    with st.container():
-        st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
-        rarity_options = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
-        selected_rarities = st.multiselect(
-            "Seltenheiten filtern", options=rarity_options, default=rarity_options,
-            format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
-        )
-        with st.expander("ℹ️ Funktionsweise"):
-            st.markdown(
-                "1. Profil auswählen oder neu speichern (URL + Name).\n"
-                "2. Beide Inventare werden aus dem Seiten-HTML gelesen (inkl. Kartenbilder, falls vorhanden).\n"
-                "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
-                "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
-                "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
-                "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥).\n\n"
-                "🔍 **Kartensuche (ganz oben):** Eigenes Profil laden → alle fehlenden Karten ansehen → Karte wählen → "
-                "du bekommst die Partner (aus deinen gespeicherten Profilen), die sie doppelt haben, samt "
-                "passenden Gegenkarten von dir."
-            )
-        st.markdown('</div>', unsafe_allow_html=True)
-
     name_map = load_name_map()
+    user = st.session_state.get("auth_user")
+    is_twitch_admin = bool(user and user.get("is_admin"))
 
-    # ---- Admin: Profile (Name + URL) verwalten ----
-    render_admin_panel(name_map)
+    # ---- Navigation links (Reiter) ----
+    nav_options = ["🔄 Tauschbörse", "🔍 1:1-Suche", "🔎 Scan"]
+    if is_twitch_admin:
+        nav_options.append("🛠️ Admin")
 
-    # ---- Kartensuche & Tauschpartner (ganz oben) ----
-    render_search_section(name_map, selected_rarities)
-    st.divider()
+    with st.sidebar:
+        st.markdown("### 🧭 Navigation")
+        page = st.radio("Navigation", nav_options, label_visibility="collapsed", key="nav_page")
+        st.divider()
 
-    # ---- Profile: gespeichert wählen oder neu anlegen ----
+    rarity_options = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
+    selected_rarities = st.session_state.get("rarity_filter", rarity_options)
+
+    # ---- Toolbar: Seltenheiten-Filter (nur auf den Reitern, die ihn brauchen) ----
+    if page in ("🔄 Tauschbörse", "🔍 1:1-Suche"):
+        with st.container():
+            st.markdown('<div class="panel">', unsafe_allow_html=True)
+            st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
+            selected_rarities = st.multiselect(
+                "Seltenheiten filtern", options=rarity_options, default=rarity_options,
+                format_func=lambda r: RARITY_LABEL_DE.get(r, r), label_visibility="collapsed",
+                key="rarity_filter",
+            )
+            with st.expander("ℹ️ Funktionsweise"):
+                st.markdown(
+                    "1. Profil auswählen oder neu speichern (URL + Name).\n"
+                    "2. Beide Inventare werden aus dem Seiten-HTML gelesen (inkl. Kartenbilder, falls vorhanden).\n"
+                    "3. Karten, die einer **doppelt hat (≥2)** und dem anderen **fehlen (=0)**, werden zu "
+                    "**direkten 1:1-Tauschgeschäften** zusammengeführt (gleiche Seltenheit gegen gleiche).\n"
+                    "4. Übrig gebliebene Angebote ohne Gegenpart erscheinen als **offen**.\n\n"
+                    "✨ Unterstützt auch die Seltenheit **Shiny**. Unter jeder Karte steht der zugehörige **Streamer** (🎥).\n\n"
+                    "🔍 **1:1-Suche (eigener Reiter):** Eigenes Profil laden → alle fehlenden Karten ansehen → Karte "
+                    "wählen → du bekommst die Partner (aus deinen gespeicherten Profilen), die sie doppelt haben, "
+                    "samt passenden Gegenkarten von dir."
+                )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---- 🛠️ Admin: Twitch-Nutzerverwaltung + Profile (Name/URL) verwalten ----
+    if page == "🛠️ Admin":
+        auth_ui.render_admin_dashboard()
+        render_admin_panel(name_map)
+        return
+
+    # ---- 🔎 Scan: Profil-Links von einer Profilseite auslesen ----
+    if page == "🔎 Scan":
+        render_scan_tool()
+        return
+
+    # ---- 🔍 1:1-Suche: Kartensuche & Tauschpartner ----
+    if page == "🔍 1:1-Suche":
+        render_search_section(name_map, selected_rarities)
+        return
+
+    # ---- 🔄 Tauschbörse (Standard): Profile gespeichert wählen oder neu anlegen ----
     st.markdown('<div class="section-title">👥 Profile</div>', unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
