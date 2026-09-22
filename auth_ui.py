@@ -14,9 +14,9 @@ Verbindet db.py + twitch_auth.py zu fertigen Streamlit-Bausteinen:
                                 eingeloggte Nutzer is_admin == True hat.
 """
 
-from typing import Set
+from typing import Any, Dict, Set
+import html as html_lib
 
-import pandas as pd
 import streamlit as st
 
 import db
@@ -191,104 +191,256 @@ def render_login_gate() -> bool:
     return True
 
 
+_ADMIN_CSS = """
+<style>
+.admin-shell { display:flex; gap:0; border-radius:18px; overflow:hidden;
+    border:1px solid #2a2c45; margin: 6px 0 26px 0; background:#0d0e18; }
+.admin-nav {
+    background: linear-gradient(180deg, #1c1030 0%, #120c1f 100%);
+    padding: 18px 12px; min-width: 190px; border-right: 1px solid #2a2c45;
+}
+.admin-nav-title { font-weight:800; color:#eceef8; font-size:0.95rem;
+    padding: 4px 6px 14px 6px; }
+.admin-col { padding: 20px 22px; }
+.admin-col-right { border-left: 1px solid #2a2c45; min-width: 260px; max-width: 300px; }
+.admin-header-row { display:flex; align-items:center; justify-content:space-between;
+    margin-bottom: 14px; }
+.admin-header-row h3 { margin:0; font-size:1.15rem; color:#eceef8; }
+.admin-count { color:#8b8d9e; font-size:0.82rem; margin-left:8px; }
+.admin-row {
+    display:flex; align-items:center; gap:12px; padding:9px 10px; border-radius:10px;
+    border:1px solid transparent;
+}
+.admin-row:hover { background: rgba(255,255,255,0.03); border-color:#2a2c45; }
+.admin-avatar { width:34px; height:34px; border-radius:50%; object-fit:cover;
+    border:1px solid #2a2c45; flex-shrink:0; background:#1c1d2c; }
+.admin-name { font-weight:700; color:#e7e7ef; font-size:0.92rem; }
+.admin-sub { color:#7d7f97; font-size:0.72rem; }
+.admin-badge {
+    display:inline-block; padding:2px 9px; border-radius:6px; font-size:0.68rem;
+    font-weight:800; white-space:nowrap; text-transform:uppercase; letter-spacing:0.02em;
+}
+.admin-badge-admin { background: rgba(245,158,11,0.18); color:#f59e0b; border:1px solid #f59e0b; }
+.admin-badge-supporter { background: rgba(192,38,211,0.18); color:#d94ded; border:1px solid #c026d3; }
+.admin-badge-viewer { background: rgba(156,163,175,0.18); color:#b7bac4; border:1px solid #9ca3af; }
+.admin-badge-approved { background: rgba(34,197,94,0.18); color:#34d399; border:1px solid #22c55e; }
+.admin-badge-pending { background: rgba(59,130,246,0.18); color:#5b9bff; border:1px solid #3b82f6; }
+.admin-badge-banned { background: rgba(239,68,68,0.18); color:#f87171; border:1px solid #ef4444; }
+.admin-detail-card { text-align:center; padding: 6px 4px 18px 4px; }
+.admin-detail-card img { width:64px; height:64px; border-radius:50%; object-fit:cover;
+    border:2px solid #2a2c45; margin-bottom:8px; }
+.admin-detail-name { font-weight:800; font-size:1.05rem; color:#eceef8; }
+.admin-info-label { color:#7d7f97; font-size:0.72rem; text-transform:uppercase;
+    letter-spacing:0.04em; margin-top:12px; }
+.admin-info-value { color:#e2e3f2; font-size:0.9rem; font-weight:600; margin-top:2px; }
+.admin-empty { color:#7d7f97; font-size:0.85rem; padding: 20px 6px; text-align:center; }
+</style>
+"""
+
+
+def _rang_badge_html(u: Dict[str, Any]) -> str:
+    if u.get("is_admin"):
+        return '<span class="admin-badge admin-badge-admin">🛡️ Admin</span>'
+    if u.get("is_supporter"):
+        return '<span class="admin-badge admin-badge-supporter">🧡 Supporter</span>'
+    return '<span class="admin-badge admin-badge-viewer">Zuschauer</span>'
+
+
+def _status_badge_html(u: Dict[str, Any]) -> str:
+    if u.get("is_banned"):
+        return '<span class="admin-badge admin-badge-banned">🚫 Gesperrt</span>'
+    if not u.get("is_approved"):
+        return '<span class="admin-badge admin-badge-pending">⏳ Wartet</span>'
+    return '<span class="admin-badge admin-badge-approved">✅ Freigegeben</span>'
+
+
 def render_admin_dashboard() -> None:
-    """Moderations-Bereich: „Freigaben“ (neue User freischalten) für Admin + Supporter,
-    volle Nutzerverwaltung (Admin-/Supporter-Vergabe, Sperren) nur für Admins.
-    Rendert sich nur, wenn der eingeloggte Nutzer is_admin ODER is_supporter hat."""
+    """Moderations-Dashboard im Stil „Nutzerübersicht / Freigaben / Gesperrt“ mit
+    Detail-Panel rechts. Freigeben+Bannen für Admin + Supporter, volle Rechteverwaltung
+    (Admin-/Supporter-Vergabe) nur für Admins. Rendert sich nur, wenn der eingeloggte
+    Nutzer is_admin ODER is_supporter hat."""
     user = st.session_state.get("auth_user")
     if not user or not (user.get("is_admin") or user.get("is_supporter")):
         return
 
-    # ---- Freigaben: neue, noch nicht freigeschaltete User (Admin + Supporter) ----
-    pending = db.get_pending_users()
-    with st.expander(f"🟢 Freigaben ({len(pending)} wartend)", expanded=bool(pending)):
-        if not pending:
-            st.caption("Aktuell wartet niemand auf Freigabe.")
-        else:
-            for u in pending:
-                c_img, c_name, c_ok, c_ban = st.columns([1, 4, 2, 2])
-                with c_img:
-                    if u.get("profile_image_url"):
-                        st.image(u["profile_image_url"], width=36)
-                with c_name:
-                    st.markdown(f"**{u['twitch_username']}**")
-                    st.caption(f"Letzter Login: {u.get('last_login') or '–'}")
-                with c_ok:
-                    if st.button("✅ Freigeben", key=f"approve_{u['id']}", use_container_width=True):
-                        db.set_approved(u["id"], True)
-                        st.rerun()
-                with c_ban:
-                    if st.button("🚫 Bannen", key=f"reject_{u['id']}", use_container_width=True):
-                        db.set_banned(u["id"], True)
-                        st.rerun()
+    is_full_admin = bool(user.get("is_admin"))
+    st.markdown(_ADMIN_CSS, unsafe_allow_html=True)
 
-    # ---- Volle Nutzerverwaltung (Admin/Supporter/Gesperrt/Freigegeben) nur für Admins ----
-    if not user.get("is_admin"):
-        return
+    with st.expander("🛠️ Moderations-Dashboard", expanded=False):
+        all_users = db.get_all_users()
+        pending_count = sum(1 for u in all_users if not u["is_approved"] and not u["is_banned"])
+        banned_count = sum(1 for u in all_users if u["is_banned"])
 
-    with st.expander("🛠️ Admin-Dashboard: Nutzerverwaltung", expanded=False):
-        users = db.get_all_users()
-        if not users:
-            st.caption("Noch keine Nutzer registriert.")
-            return
-
-        st.caption(f"{len(users)} registrierte Nutzer – Häkchen setzen und speichern:")
-
-        df = pd.DataFrame(users)[
-            ["id", "twitch_username", "twitch_id", "last_login", "is_admin", "is_supporter",
-             "is_approved", "is_banned"]
-        ].rename(columns={
-            "id": "ID",
-            "twitch_username": "Twitch-Name",
-            "twitch_id": "Twitch-ID",
-            "last_login": "Letzter Login",
-            "is_admin": "Admin",
-            "is_supporter": "Supporter",
-            "is_approved": "Freigegeben",
-            "is_banned": "Gesperrt",
-        })
-        for col in ("Admin", "Supporter", "Freigegeben", "Gesperrt"):
-            df[col] = df[col].astype(bool)
-
-        edited = st.data_editor(
-            df,
-            column_config={
-                "ID": st.column_config.NumberColumn(disabled=True),
-                "Twitch-Name": st.column_config.TextColumn(disabled=True),
-                "Twitch-ID": st.column_config.TextColumn(disabled=True),
-                "Letzter Login": st.column_config.TextColumn(disabled=True),
-                "Admin": st.column_config.CheckboxColumn(help="Adminrechte vergeben/entziehen"),
-                "Supporter": st.column_config.CheckboxColumn(help="Supporter-Rechte vergeben/entziehen"),
-                "Freigegeben": st.column_config.CheckboxColumn(help="Zugriff freischalten/entziehen"),
-                "Gesperrt": st.column_config.CheckboxColumn(help="Nutzer sperren/entsperren"),
-            },
-            hide_index=True,
-            use_container_width=True,
-            key="admin_user_editor",
+        # ---- Navigation (nur Admins bekommen alle 3 Bereiche, Supporter nur Freigaben) ----
+        sections = (
+            [("overview", "👥 Nutzerübersicht"), ("pending", f"🟢 Freigaben ({pending_count})"),
+             ("banned", f"🚫 Gesperrt ({banned_count})")]
+            if is_full_admin
+            else [("pending", f"🟢 Freigaben ({pending_count})")]
         )
+        active = st.session_state.get("admin_nav_section", sections[0][0])
+        if active not in dict(sections):
+            active = sections[0][0]
 
-        if st.button("💾 Änderungen speichern", key="admin_save_users"):
-            by_id = {u["id"]: u for u in users}
-            changed = 0
-            for _, row in edited.iterrows():
-                uid = int(row["ID"])
-                orig = by_id.get(uid)
-                if orig is None:
-                    continue
-                if bool(row["Admin"]) != bool(orig["is_admin"]):
-                    db.set_admin(uid, bool(row["Admin"]))
-                    changed += 1
-                if bool(row["Supporter"]) != bool(orig["is_supporter"]):
-                    db.set_supporter(uid, bool(row["Supporter"]))
-                    changed += 1
-                if bool(row["Freigegeben"]) != bool(orig["is_approved"]):
-                    db.set_approved(uid, bool(row["Freigegeben"]))
-                    changed += 1
-                if bool(row["Gesperrt"]) != bool(orig["is_banned"]):
-                    db.set_banned(uid, bool(row["Gesperrt"]))
-                    changed += 1
-            if changed:
-                st.success(f"{changed} Änderung(en) gespeichert.")
-                st.rerun()
+        nav_col, list_col, detail_col = st.columns([1, 2.6, 1.3])
+
+        with nav_col:
+            st.markdown('<div class="admin-nav-title">Bereich</div>', unsafe_allow_html=True)
+            for key, label in sections:
+                if st.button(
+                    label, key=f"admin_nav_{key}", use_container_width=True,
+                    type="primary" if key == active else "secondary",
+                ):
+                    st.session_state["admin_nav_section"] = key
+                    st.session_state.pop("admin_page", None)
+                    st.rerun()
+
+        # ---- Liste je nach aktivem Bereich filtern ----
+        if active == "pending":
+            filtered = [u for u in all_users if not u["is_approved"] and not u["is_banned"]]
+            title = "Freigaben"
+        elif active == "banned":
+            filtered = [u for u in all_users if u["is_banned"]]
+            title = "Gesperrte User"
+        else:
+            filtered = all_users
+            title = "Aktuelle User"
+
+        with list_col:
+            st.markdown(
+                f'<div class="admin-header-row"><h3>{title}</h3>'
+                f'<span class="admin-count">{len(filtered)} gesamt</span></div>',
+                unsafe_allow_html=True,
+            )
+            search = st.text_input(
+                "User suchen", key="admin_search", placeholder="🔍 User suchen …",
+                label_visibility="collapsed",
+            )
+            if search.strip():
+                needle = search.strip().lower()
+                filtered = [u for u in filtered if needle in u["twitch_username"].lower()]
+
+            if not filtered:
+                st.markdown('<div class="admin-empty">Keine User in diesem Bereich.</div>', unsafe_allow_html=True)
             else:
-                st.info("Keine Änderungen erkannt.")
+                page_size = 10
+                total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
+                page = min(st.session_state.get("admin_page", 1), total_pages)
+                start = (page - 1) * page_size
+                page_users = filtered[start:start + page_size]
+
+                selected_id = st.session_state.get("admin_selected_user_id")
+                if page_users and selected_id not in {u["id"] for u in page_users} and selected_id not in {u["id"] for u in all_users}:
+                    st.session_state["admin_selected_user_id"] = page_users[0]["id"]
+                    selected_id = page_users[0]["id"]
+                elif selected_id is None and page_users:
+                    st.session_state["admin_selected_user_id"] = page_users[0]["id"]
+                    selected_id = page_users[0]["id"]
+
+                for u in page_users:
+                    c_img, c_name, c_view, c_ok, c_ban = st.columns([0.6, 2.6, 0.7, 0.7, 0.7])
+                    with c_img:
+                        if u.get("profile_image_url"):
+                            st.markdown(
+                                f'<img class="admin-avatar" src="{html_lib.escape(u["profile_image_url"])}" />',
+                                unsafe_allow_html=True,
+                            )
+                    with c_name:
+                        st.markdown(
+                            f'<div class="admin-name">{html_lib.escape(u["twitch_username"])}</div>'
+                            f'<div style="margin-top:2px;">{_rang_badge_html(u)} {_status_badge_html(u)}</div>',
+                            unsafe_allow_html=True,
+                        )
+                    with c_view:
+                        if st.button("👁️", key=f"admin_view_{u['id']}", help="Details anzeigen"):
+                            st.session_state["admin_selected_user_id"] = u["id"]
+                            st.rerun()
+                    with c_ok:
+                        if not u["is_approved"] or u["is_banned"]:
+                            if st.button("✅", key=f"admin_approve_{u['id']}", help="Freigeben / entbannen"):
+                                db.set_approved(u["id"], True)
+                                db.set_banned(u["id"], False)
+                                st.rerun()
+                    with c_ban:
+                        if not u["is_banned"]:
+                            if st.button("🚫", key=f"admin_ban_{u['id']}", help="Bannen"):
+                                db.set_banned(u["id"], True)
+                                st.rerun()
+
+                if total_pages > 1:
+                    p_prev, p_info, p_next = st.columns([1, 3, 1])
+                    with p_prev:
+                        if st.button("‹", key="admin_page_prev", disabled=page <= 1, use_container_width=True):
+                            st.session_state["admin_page"] = page - 1
+                            st.rerun()
+                    with p_info:
+                        st.markdown(
+                            f'<div style="text-align:center; color:#8b8d9e; font-size:0.82rem; padding-top:6px;">'
+                            f'Zeige {start + 1}–{min(start + page_size, len(filtered))} von {len(filtered)}'
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with p_next:
+                        if st.button("›", key="admin_page_next", disabled=page >= total_pages, use_container_width=True):
+                            st.session_state["admin_page"] = page + 1
+                            st.rerun()
+
+        # ---- Detail-Panel rechts für den ausgewählten User ----
+        with detail_col:
+            selected_id = st.session_state.get("admin_selected_user_id")
+            selected = next((u for u in all_users if u["id"] == selected_id), None)
+            if not selected:
+                st.markdown('<div class="admin-empty">Wähle links einen User aus.</div>', unsafe_allow_html=True)
+            else:
+                avatar = selected.get("profile_image_url") or ""
+                st.markdown(
+                    '<div class="admin-detail-card">'
+                    + (f'<img src="{html_lib.escape(avatar)}" />' if avatar else "")
+                    + f'<div class="admin-detail-name">{html_lib.escape(selected["twitch_username"])}</div>'
+                    + f'<div style="margin-top:6px;">{_status_badge_html(selected)}</div>'
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown('<div class="admin-info-label">Rang</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="admin-info-value">{_rang_badge_html(selected)}</div>', unsafe_allow_html=True)
+                st.markdown('<div class="admin-info-label">Letzter Login</div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="admin-info-value">{html_lib.escape(selected.get("last_login") or "–")}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown('<div class="admin-info-label">Twitch-ID</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="admin-info-value">{html_lib.escape(selected["twitch_id"])}</div>', unsafe_allow_html=True)
+
+                st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
+
+                if selected["is_banned"]:
+                    if st.button("✅ Entbannen", key="admin_detail_unban", use_container_width=True, type="primary"):
+                        db.set_banned(selected["id"], False)
+                        st.rerun()
+                else:
+                    if not selected["is_approved"]:
+                        if st.button("✅ Freigeben", key="admin_detail_approve", use_container_width=True, type="primary"):
+                            db.set_approved(selected["id"], True)
+                            st.rerun()
+                    if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
+                        db.set_banned(selected["id"], True)
+                        st.rerun()
+
+                if is_full_admin and selected["id"] != user["id"]:
+                    st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
+                    if selected.get("is_admin"):
+                        if st.button("🛡️ Admin entziehen", key="admin_detail_unadmin", use_container_width=True):
+                            db.set_admin(selected["id"], False)
+                            st.rerun()
+                    else:
+                        if st.button("🛡️ Zum Admin machen", key="admin_detail_admin", use_container_width=True):
+                            db.set_admin(selected["id"], True)
+                            st.rerun()
+                    if selected.get("is_supporter"):
+                        if st.button("🧡 Supporter entziehen", key="admin_detail_unsupp", use_container_width=True):
+                            db.set_supporter(selected["id"], False)
+                            st.rerun()
+                    else:
+                        if st.button("🧡 Zum Supporter machen", key="admin_detail_supp", use_container_width=True):
+                            db.set_supporter(selected["id"], True)
+                            st.rerun()
