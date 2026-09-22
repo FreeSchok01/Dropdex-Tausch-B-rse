@@ -29,7 +29,7 @@ import twitch_auth
 # Deine Twitch-ID findest du z.B. über https://streamscharts.com/tools/convert-username
 # ---------------------------------------------------------------------------
 BOOTSTRAP_ADMIN_TWITCH_IDS: Set[str] = {
-    # "123456789",
+     "171478372",
 }
 
 
