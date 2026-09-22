@@ -3657,19 +3657,26 @@ def stat_card(label: str, value: str, extra: str = "") -> str:
     )
 
 
-def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str, str]:
+def profile_picker(label: str, slot: str, name_map: Dict[str, str], allow_new: bool = True) -> Tuple[str, str]:
     """Profil-Auswahl per Panel: gespeicherte Profile per Dropdown wählen (nur Name sichtbar,
-    keine URL) oder ein neues per URL + Name anlegen und dauerhaft speichern (dropdex_namen.json)."""
+    keine URL) oder – falls allow_new=True – ein neues per URL + Name anlegen und dauerhaft
+    speichern (dropdex_namen.json). Mit allow_new=False (z.B. im 1:1-Tausch) kann nur aus der
+    bestehenden, öffentlichen Liste gewählt werden."""
     st.markdown(f'<div class="panel-label">👤 {html_lib.escape(label)}</div>', unsafe_allow_html=True)
 
     saved = sorted(name_map.items(), key=lambda kv: kv[1].lower())  # [(url, name), ...]
     new_entry_label = "➕ Neues Profil hinzufügen …"
-    options = [new_entry_label] + [name for _, name in saved]
+
+    if not saved and not allow_new:
+        st.info("Noch keine öffentlichen Profile vorhanden – ein Admin muss zuerst welche hinzufügen.")
+        return "", ""
+
+    options = ([new_entry_label] if allow_new else []) + [name for _, name in saved]
     choice = st.selectbox(
         "Gespeichertes Profil", options, key=f"picker_{slot}", label_visibility="collapsed",
     )
 
-    if choice == new_entry_label or not saved:
+    if allow_new and (choice == new_entry_label or not saved):
         c1, c2 = st.columns([2, 1])
         with c1:
             url = st.text_input(
@@ -3693,7 +3700,7 @@ def profile_picker(label: str, slot: str, name_map: Dict[str, str]) -> Tuple[str
         )
         return (url.strip(), name.strip())
 
-    idx = options.index(choice) - 1
+    idx = options.index(choice) - (1 if allow_new else 0)
     url, name = saved[idx]
     st.markdown(f'<div class="panel-hint">✅ Ausgewählt: {html_lib.escape(name)}</div>', unsafe_allow_html=True)
     # Hinweis: Das Entfernen aus dieser öffentlichen, gemeinsamen Profilliste ist bewusst nur
@@ -4009,7 +4016,7 @@ def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], use
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        url_p2, name_p2 = profile_picker("Spieler 2", "p2", name_map)
+        url_p2, name_p2 = profile_picker("Spieler 2", "p2", name_map, allow_new=False)
         st.markdown('</div>', unsafe_allow_html=True)
 
     url_p1, name_p1 = own_url, (own_name or own_url)
@@ -4152,7 +4159,7 @@ def main() -> None:
 
     # ---- Navigation links (Sidebar) ----
     nav_options = ["👤 Mein Profil", "🔄 1:1 Tausch"]
-    if user.get("is_admin"):
+    if user.get("is_admin") or user.get("is_supporter"):
         nav_options.append("🛠️ Admin")
     with st.sidebar:
         st.divider()
