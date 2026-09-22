@@ -65,8 +65,33 @@ def _handle_oauth_callback() -> None:
         user = db.get_user_by_twitch_id(user["twitch_id"])
 
     st.session_state["auth_user"] = user
+
+    # "Eingeloggt bleiben": Session-Token erzeugen und in der URL mitführen, statt sie
+    # zu leeren. Bei einem Reload (F5) schickt der Browser genau diese URL erneut mit,
+    # wir erkennen das Token unten in _restore_session_from_url() und loggen automatisch
+    # wieder ein - ganz ohne erneuten Twitch-Redirect.
+    session_token = db.create_session(user["twitch_id"])
     st.query_params.clear()
+    st.query_params["session"] = session_token
+    st.session_state["session_token"] = session_token
     st.rerun()
+
+
+def _restore_session_from_url() -> None:
+    """Loggt automatisch ein, wenn die URL noch ein gültiges ?session=... Token trägt
+    (z.B. nach einem Reload/F5) und noch kein Nutzer im session_state steckt."""
+    if st.session_state.get("auth_user"):
+        return
+    token = st.query_params.get("session")
+    if not token:
+        return
+    user = db.get_user_by_session_token(token)
+    if user:
+        st.session_state["auth_user"] = user
+        st.session_state["session_token"] = token
+    else:
+        # Token abgelaufen/ungültig -> aus der URL entfernen
+        st.query_params.clear()
 
 
 def render_login_gate() -> bool:
@@ -77,7 +102,9 @@ def render_login_gate() -> bool:
         False -> Nutzer ist ausgeloggt ODER gesperrt -> main() sollte returnen
     """
     db.init_db()
+    db.delete_expired_sessions()
     _handle_oauth_callback()
+    _restore_session_from_url()
 
     user = st.session_state.get("auth_user")
 
@@ -104,7 +131,12 @@ def render_login_gate() -> bool:
                 if user["is_admin"]:
                     st.caption("🛡️ Admin")
             if st.button("Ausloggen", use_container_width=True):
+                token = st.session_state.get("session_token")
+                if token:
+                    db.delete_session(token)
                 st.session_state.pop("auth_user", None)
+                st.session_state.pop("session_token", None)
+                st.query_params.clear()
                 st.rerun()
         else:
             login_url = twitch_auth.get_login_url()
