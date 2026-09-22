@@ -11,7 +11,9 @@ Tabelle `users`:
     twitch_username     TEXT             (aktueller Anzeigename)
     profile_image_url   TEXT
     is_admin            INTEGER (0/1)
+    is_supporter        INTEGER (0/1)    (Moderations-Rang unterhalb Admin, siehe Freigaben)
     is_banned           INTEGER (0/1)
+    is_approved         INTEGER (0/1)    (muss von Admin/Supporter freigegeben werden)
     last_login          TEXT (ISO-Zeitstempel, UTC)
     own_profile_url     TEXT             (eigenes, privates Dropdex-Profil des Accounts)
     own_profile_name    TEXT
@@ -86,6 +88,16 @@ def init_db() -> None:
         )
         _ensure_column(conn, "users", "own_profile_url", "TEXT DEFAULT ''")
         _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
+
+        cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        newly_added_approved = "is_approved" not in cols_before
+        _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
+        if newly_added_approved:
+            # Bestandsnutzer, die es schon vor der Freigabepflicht gab, waren faktisch immer
+            # schon freigeschaltet -> nicht nachträglich aussperren, nur künftige Neuanmeldungen
+            # (INSERT in create_user) starten mit is_approved = 0.
+            conn.execute("UPDATE users SET is_approved = 1")
 
         conn.execute(
             """
@@ -174,7 +186,35 @@ def set_banned(user_id: int, banned: bool) -> None:
 
 def set_admin(user_id: int, admin: bool) -> None:
     with get_connection() as conn:
-        conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if admin else 0, user_id))
+        if admin:
+            # Wer Admin wird, ist damit automatisch auch freigegeben.
+            conn.execute("UPDATE users SET is_admin = 1, is_approved = 1 WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
+
+
+def set_supporter(user_id: int, supporter: bool) -> None:
+    with get_connection() as conn:
+        if supporter:
+            # Wer Supporter wird, ist damit automatisch auch freigegeben.
+            conn.execute("UPDATE users SET is_supporter = 1, is_approved = 1 WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET is_supporter = 0 WHERE id = ?", (user_id,))
+
+
+def set_approved(user_id: int, approved: bool) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET is_approved = ? WHERE id = ?", (1 if approved else 0, user_id))
+
+
+def get_pending_users() -> List[Dict[str, Any]]:
+    """Nutzer, die sich eingeloggt haben, aber noch nicht von einem Admin/Supporter
+    freigegeben wurden (und nicht gesperrt sind) - für den „Freigaben“-Bereich."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY last_login DESC NULLS LAST"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
