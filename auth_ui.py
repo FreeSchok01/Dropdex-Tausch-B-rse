@@ -191,7 +191,7 @@ def render_login_gate() -> bool:
     return True
 
 
-_ADMIN_CSS = """
+ADMIN_CSS = """
 <style>
 .admin-shell { display:flex; gap:0; border-radius:18px; overflow:hidden;
     border:1px solid #2a2c45; margin: 6px 0 26px 0; background:#0d0e18; }
@@ -264,7 +264,7 @@ def render_admin_dashboard() -> None:
         return
 
     is_full_admin = bool(user.get("is_admin"))
-    st.markdown(_ADMIN_CSS, unsafe_allow_html=True)
+    st.markdown(ADMIN_CSS, unsafe_allow_html=True)
 
     with st.expander("🛠️ Moderations-Dashboard", expanded=False):
         all_users = db.get_all_users()
