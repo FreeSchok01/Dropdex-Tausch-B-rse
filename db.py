@@ -15,9 +15,10 @@ Tabelle `users`:
     last_login          TEXT (ISO-Zeitstempel, UTC)
 """
 
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,7 +40,7 @@ def get_connection():
 
 
 def init_db() -> None:
-    """Legt die Tabelle an, falls sie noch nicht existiert. Idempotent."""
+    """Legt die Tabellen an, falls sie noch nicht existieren. Idempotent."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -51,6 +52,19 @@ def init_db() -> None:
                 is_admin           INTEGER NOT NULL DEFAULT 0,
                 is_banned          INTEGER NOT NULL DEFAULT 0,
                 last_login         TEXT
+            )
+            """
+        )
+        # Für den "eingeloggt bleiben"-Mechanismus: ein langlebiges Session-Token,
+        # das (statt der Twitch-Zugangsdaten) in der URL mitgeführt wird, damit ein
+        # Reload (F5) nicht ausloggt.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                twitch_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL
             )
             """
         )
@@ -117,3 +131,49 @@ def set_banned(user_id: int, banned: bool) -> None:
 def set_admin(user_id: int, admin: bool) -> None:
     with get_connection() as conn:
         conn.execute("UPDATE users SET is_admin = ? WHERE id = ?", (1 if admin else 0, user_id))
+
+
+# ---------------------------------------------------------------------------
+# Sessions: "eingeloggt bleiben" über einen Seiten-Reload hinweg.
+# ---------------------------------------------------------------------------
+
+SESSION_TTL_DAYS = 30
+
+
+def create_session(twitch_id: str) -> str:
+    """Legt ein neues, langlebiges Session-Token für diesen Nutzer an und gibt es zurück."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=SESSION_TTL_DAYS)
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, twitch_id, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
+        )
+    return token
+
+
+def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
+    """Löst ein Session-Token auf: gültig + nicht abgelaufen -> zugehöriger Nutzer, sonst None."""
+    if not token:
+        return None
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT twitch_id FROM sessions WHERE token = ? AND expires_at > ?",
+            (token, now_iso),
+        ).fetchone()
+    if not row:
+        return None
+    return get_user_by_twitch_id(row["twitch_id"])
+
+
+def delete_session(token: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+def delete_expired_sessions() -> None:
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_iso,))
