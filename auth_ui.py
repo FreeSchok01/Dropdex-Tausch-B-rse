@@ -238,6 +238,25 @@ ADMIN_CSS = """
 """
 
 
+def _rank(u: Dict[str, Any]) -> int:
+    """Rang-Stufe für den Vergleich: Admin > Supporter > Zuschauer."""
+    if u.get("is_admin"):
+        return 3
+    if u.get("is_supporter"):
+        return 2
+    return 1
+
+
+def _can_ban(actor: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    """Admins dürfen jeden sperren/entsperren (außer sich selbst). Supporter dürfen das nur bei
+    Nutzern, die im Rang UNTER ihnen stehen – also weder Admin noch Supporter sind."""
+    if actor.get("id") == target.get("id"):
+        return False
+    if actor.get("is_admin"):
+        return True
+    return _rank(target) < _rank(actor)
+
+
 def _rang_badge_html(u: Dict[str, Any]) -> str:
     if u.get("is_admin"):
         return '<span class="admin-badge admin-badge-admin">🛡️ Admin</span>'
@@ -271,13 +290,12 @@ def render_admin_dashboard() -> None:
         pending_count = sum(1 for u in all_users if not u["is_approved"] and not u["is_banned"])
         banned_count = sum(1 for u in all_users if u["is_banned"])
 
-        # ---- Navigation (nur Admins bekommen alle 3 Bereiche, Supporter nur Freigaben) ----
-        sections = (
-            [("overview", "👥 Nutzerübersicht"), ("pending", f"🟢 Freigaben ({pending_count})"),
-             ("banned", f"🚫 Gesperrt ({banned_count})")]
-            if is_full_admin
-            else [("pending", f"🟢 Freigaben ({pending_count})")]
-        )
+        # ---- Navigation: Admins UND Supporter sehen alle 3 Bereiche (inkl. voller
+        # Nutzerübersicht) – wer davon wen sperren/entsperren darf, regelt _can_ban() unten. ----
+        sections = [
+            ("overview", "👥 Nutzerübersicht"), ("pending", f"🟢 Freigaben ({pending_count})"),
+            ("banned", f"🚫 Gesperrt ({banned_count})"),
+        ]
         active = st.session_state.get("admin_nav_section", sections[0][0])
         if active not in dict(sections):
             active = sections[0][0]
@@ -356,13 +374,17 @@ def render_admin_dashboard() -> None:
                             st.session_state["admin_selected_user_id"] = u["id"]
                             st.rerun()
                     with c_ok:
-                        if not u["is_approved"] or u["is_banned"]:
+                        # Freigeben (unbanned + nicht freigegeben) darf jeder Moderator; Entbannen
+                        # (is_banned) nur, wenn der Rang des Ziels unter dem eigenen liegt.
+                        show_ok = (not u["is_approved"] and not u["is_banned"]) or \
+                            (u["is_banned"] and _can_ban(user, u))
+                        if show_ok:
                             if st.button("✅", key=f"admin_approve_{u['id']}", help="Freigeben / entbannen"):
                                 db.set_approved(u["id"], True)
                                 db.set_banned(u["id"], False)
                                 st.rerun()
                     with c_ban:
-                        if not u["is_banned"]:
+                        if not u["is_banned"] and _can_ban(user, u):
                             if st.button("🚫", key=f"admin_ban_{u['id']}", help="Bannen"):
                                 db.set_banned(u["id"], True)
                                 st.rerun()
@@ -414,17 +436,23 @@ def render_admin_dashboard() -> None:
                 st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
 
                 if selected["is_banned"]:
-                    if st.button("✅ Entbannen", key="admin_detail_unban", use_container_width=True, type="primary"):
-                        db.set_banned(selected["id"], False)
-                        st.rerun()
+                    if _can_ban(user, selected):
+                        if st.button("✅ Entbannen", key="admin_detail_unban", use_container_width=True, type="primary"):
+                            db.set_banned(selected["id"], False)
+                            st.rerun()
+                    else:
+                        st.caption("Dieser Nutzer steht in deinem Rang oder darüber – du kannst ihn nicht entbannen.")
                 else:
                     if not selected["is_approved"]:
                         if st.button("✅ Freigeben", key="admin_detail_approve", use_container_width=True, type="primary"):
                             db.set_approved(selected["id"], True)
                             st.rerun()
-                    if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
-                        db.set_banned(selected["id"], True)
-                        st.rerun()
+                    if _can_ban(user, selected):
+                        if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
+                            db.set_banned(selected["id"], True)
+                            st.rerun()
+                    elif selected["id"] != user["id"]:
+                        st.caption("Dieser Nutzer steht in deinem Rang oder darüber – du kannst ihn nicht bannen.")
 
                 if is_full_admin and selected["id"] != user["id"]:
                     st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
