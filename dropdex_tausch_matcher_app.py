@@ -3066,6 +3066,40 @@ CSS = """
     section[data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"]:hover {
         filter: brightness(1.08);
     }
+
+    /* ---- Sidebar: transparenter Hintergrund (nutzt den Seiten-Hintergrund durch) ---- */
+    section[data-testid="stSidebar"],
+    section[data-testid="stSidebar"] > div,
+    section[data-testid="stSidebar"] div[data-testid="stSidebarContent"],
+    section[data-testid="stSidebar"] div[data-testid="stSidebarUserContent"] {
+        background: transparent !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] { border-right: 1px solid rgba(255,255,255,0.06) !important; }
+    section[data-testid="stSidebar"] .block-container { padding-top: 18px !important; }
+
+    /* ---- Account-Karte oben in der Sidebar (kompakt statt Columns-Layout) ---- */
+    .account-card {
+        display: flex; align-items: center; gap: 12px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
+        border: 1px solid #262840; border-radius: 14px; padding: 10px 14px; margin: 0 0 8px 0;
+    }
+    .account-avatar {
+        width: 40px; height: 40px; border-radius: 50%; object-fit: cover;
+        border: 2px solid #7c3aed; flex-shrink: 0;
+    }
+    .account-avatar--fallback {
+        display: flex; align-items: center; justify-content: center; background: #1c1d2e; font-size: 1.1rem;
+    }
+    .account-meta { min-width: 0; }
+    .account-name {
+        font-weight: 800; color: #f1f1fb; font-size: 0.92rem;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .account-badge { font-size: 0.7rem; font-weight: 700; margin-top: 2px; }
+    .account-badge--admin { color: #60a5fa; }
+    .account-badge--supporter { color: #fb923c; }
+    .side-divider { border: none; border-top: 1px solid rgba(255,255,255,0.08); margin: 10px 0 14px 0; }
 </style>
 """
 
@@ -4570,7 +4604,6 @@ def main() -> None:
 
     # ---- Navigation links (Sidebar), im Stil: Gruppenlabel + Icon-Pills ----
     with st.sidebar:
-        st.divider()
         page = render_sidebar_nav(user)
 
     # ---- Toolbar: Seltenheiten-Filter – gilt nur für die Tauschbörse-Bereiche, nicht für
