@@ -24,11 +24,18 @@ Tabelle `progress_snapshots` (Verlauf des Sammelfortschritts pro Nutzer):
     distinct_total      INTEGER          (verschiedene Karten insgesamt im Profil)
     total_copies        INTEGER          (Karten insgesamt inkl. Dubletten)
     missing_count       INTEGER          (fehlende, verschiedene Karten)
+
+Tabelle `sessions` ("eingeloggt bleiben" über ?session=... in der URL):
+    token               TEXT PRIMARY KEY (zufälliges Token, landet in der URL)
+    twitch_id           TEXT             (-> users.twitch_id)
+    created_at          TEXT (ISO-Zeitstempel, UTC)
+    expires_at          TEXT (ISO-Zeitstempel, UTC; nach SESSION_TTL_DAYS abgelaufen)
 """
 
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +43,9 @@ from typing import Any, Dict, List, Optional
 # Speicher des Hosters nicht flüchtig ist (siehe Hinweis im Admin-Panel
 # der Haupt-App zu dropdex_namen.json - gilt hier analog).
 DB_PATH = Path(__file__).with_name("dropdex_users.db")
+
+# "Eingeloggt bleiben": so lange ist ein Session-Token nach dem Login gültig.
+SESSION_TTL_DAYS = 30
 
 
 @contextmanager
@@ -88,6 +98,17 @@ def init_db() -> None:
                 total_copies    INTEGER NOT NULL,
                 missing_count   INTEGER NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                twitch_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL
             )
             """
         )
@@ -211,3 +232,49 @@ def get_latest_progress(user_id: int) -> Optional[Dict[str, Any]]:
             (user_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Sessions ("eingeloggt bleiben" per Token in der URL, siehe auth_ui.py)
+# ---------------------------------------------------------------------------
+
+def create_session(twitch_id: str) -> str:
+    """Erzeugt ein neues, zufälliges Session-Token für diesen Nutzer und speichert es
+    mit Ablaufzeit (SESSION_TTL_DAYS). Gibt das Token zurück, das in die URL kommt."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=SESSION_TTL_DAYS)
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, twitch_id, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
+        )
+    return token
+
+
+def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
+    """Liefert den Nutzer zu einem Session-Token, sofern es existiert und noch nicht
+    abgelaufen ist - sonst None."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT twitch_id FROM sessions WHERE token = ? AND expires_at > ?",
+            (token, now),
+        ).fetchone()
+        if not row:
+            return None
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE twitch_id = ?", (row["twitch_id"],)
+        ).fetchone()
+        return dict(user_row) if user_row else None
+
+
+def delete_session(token: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+def delete_expired_sessions() -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
