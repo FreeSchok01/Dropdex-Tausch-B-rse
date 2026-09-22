@@ -35,6 +35,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
+
 # ----------------------------------------------------------------------------
 # Konstanten
 # ----------------------------------------------------------------------------
@@ -3869,6 +3871,13 @@ def main() -> None:
         '1:1-Tauschgeschäfte zusammen.</p></div>',
         unsafe_allow_html=True,
     )
+
+    # ---- Twitch-Login-Gate: ohne Login bzw. bei Bann geht es hier nicht weiter ----
+    if not auth_ui.render_login_gate():
+        return
+
+    # ---- Admin-Dashboard (nur sichtbar für is_admin == True) ----
+    auth_ui.render_admin_dashboard()
 
     # ---- Toolbar: Seltenheiten-Filter (oben, keine Sidebar) ----
     with st.container():
