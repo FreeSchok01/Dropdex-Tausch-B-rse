@@ -4607,9 +4607,9 @@ def main() -> None:
         page = render_sidebar_nav(user)
 
     # ---- Toolbar: Seltenheiten-Filter – gilt nur für die Tauschbörse-Bereiche, nicht für
-    # „Mein Profil“ (dort werden immer ALLE Karten des eigenen Profils angezeigt, wie auf dropdex.de). ----
+    # „Mein Profil“ und nicht für „Admin“ (dort gibt es keine Kartenliste, die gefiltert werden könnte). ----
     selected_rarities: List[str] = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
-    if page != "👤 Mein Profil":
+    if page not in ("👤 Mein Profil", "🛠️ Admin"):
         with st.container():
             st.markdown('<div class="panel">', unsafe_allow_html=True)
             st.markdown('<div class="panel-label">⚙️ Filter & Optionen</div>', unsafe_allow_html=True)
