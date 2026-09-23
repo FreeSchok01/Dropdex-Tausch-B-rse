@@ -21,7 +21,7 @@ import notifications
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_watch.db")
 
 # Muss zur Auto-Refresh-Rate im Frontend passen (siehe render_auto_refresh() in der App).
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 60
 
 
 def _connect() -> sqlite3.Connection:
