@@ -125,19 +125,6 @@ def init_db() -> None:
             """
         )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS favorites (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id       INTEGER NOT NULL,
-                profile_url   TEXT NOT NULL,
-                profile_name  TEXT NOT NULL,
-                added_at      TEXT NOT NULL,
-                UNIQUE(user_id, profile_url)
-            )
-            """
-        )
-
 
 def get_user_by_twitch_id(twitch_id: str) -> Optional[Dict[str, Any]]:
     with get_connection() as conn:
@@ -182,6 +169,24 @@ def get_or_create_user(twitch_id: str, twitch_username: str, profile_image_url: 
         return create_user(twitch_id, twitch_username, profile_image_url)
     touch_last_login(twitch_id, twitch_username, profile_image_url)
     return get_user_by_twitch_id(twitch_id)
+
+
+def search_users_by_username(query: str, exclude_user_id: Optional[int] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """Sucht registrierte, nicht gesperrte Nutzer per (Teil-)Twitch-Username - für die
+    Chat-Suche ("💬 Chat" -> Nutzer per Namen finden, unabhängig von Tausch-Matches)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE twitch_username LIKE ? AND is_banned = 0 "
+            "ORDER BY twitch_username COLLATE NOCASE LIMIT ?",
+            (f"%{q}%", limit),
+        ).fetchall()
+    results = [dict(r) for r in rows]
+    if exclude_user_id is not None:
+        results = [r for r in results if r["id"] != exclude_user_id]
+    return results
 
 
 def get_all_users() -> List[Dict[str, Any]]:
@@ -331,43 +336,3 @@ def delete_expired_sessions() -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
-
-
-# ---------------------------------------------------------------------------
-# Favoriten (im 1:1-Tausch als "Spieler 2" gespeicherte Wunschpartner je Account)
-# ---------------------------------------------------------------------------
-
-def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
-    """Merkt sich ein Profil als Favorit für diesen Account (überschreibt den Namen, falls das
-    Profil schon favorisiert war und sich der Name inzwischen geändert hat)."""
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO favorites (user_id, profile_url, profile_name, added_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
-            (user_id, profile_url, profile_name, now),
-        )
-
-
-def remove_favorite(user_id: int, profile_url: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?", (user_id, profile_url)
-        )
-
-
-def get_favorites(user_id: int) -> List[Dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
-            (user_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def is_favorite(user_id: int, profile_url: str) -> bool:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?", (user_id, profile_url)
-        ).fetchone()
-        return row is not None
