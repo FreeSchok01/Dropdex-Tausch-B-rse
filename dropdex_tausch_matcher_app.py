@@ -5044,13 +5044,15 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
     Gibt das Label der aktuell gewählten Seite zurück (kompatibel zum bisherigen `page`-String).
 
     Admin und Supporter bekommen bewusst getrennte Reiter (statt einem gemeinsamen "Admin"-
-    Reiter): Admins sehen "🛠️ Admin" (voller Zugriff inkl. Profile löschen), Supporter sehen
-    "🧡 Supporter" (u.a. Profile hinzufügen, aber nicht löschen - siehe render_admin_panel()).
-    Normale User (weder Admin noch Supporter) sehen keinen der beiden Reiter."""
+    Reiter): Supporter sehen "🧡 Supporter" (u.a. Profile hinzufügen, aber nicht löschen -
+    siehe render_admin_panel()). Admins sehen zusätzlich zu ihrem eigenen "🛠️ Admin"-Reiter
+    (voller Zugriff inkl. Profile löschen) auch den "🧡 Supporter"-Reiter, damit sie sich
+    jederzeit ansehen können, was Supporter sehen. Normale User (weder Admin noch Supporter)
+    sehen keinen der beiden Reiter."""
     groups = list(SIDEBAR_NAV_GROUPS)
     if user.get("is_admin"):
         groups.append(("ADMIN", [("admin", "🛠️", "Admin")]))
-    elif user.get("is_supporter"):
+    if user.get("is_admin") or user.get("is_supporter"):
         groups.append(("SUPPORTER", [("supporter", "🧡", "Supporter")]))
 
     if "current_page" not in st.session_state:
