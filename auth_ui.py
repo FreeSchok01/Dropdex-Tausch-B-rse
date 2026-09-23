@@ -34,6 +34,15 @@ BOOTSTRAP_ADMIN_TWITCH_IDS: Set[str] = {
      "133037208",
 }
 
+# ---------------------------------------------------------------------------
+# Twitch-IDs, die beim ersten Login automatisch is_supporter = True bekommen
+# (gleiches Muster wie BOOTSTRAP_ADMIN_TWITCH_IDS oben, nur für den Rang
+# Supporter statt Admin). Einfach die Twitch-ID hier eintragen.
+# ---------------------------------------------------------------------------
+BOOTSTRAP_SUPPORTER_TWITCH_IDS: Set[str] = {
+     # "DEINE_SUPPORTER_TWITCH_ID_HIER",
+}
+
 
 def _handle_oauth_callback() -> None:
     """Wird bei jedem Rerun aufgerufen; reagiert nur, wenn Twitch uns per
@@ -64,6 +73,9 @@ def _handle_oauth_callback() -> None:
     user = db.get_or_create_user(**twitch_user)
     if user["twitch_id"] in BOOTSTRAP_ADMIN_TWITCH_IDS and not user["is_admin"]:
         db.set_admin(user["id"], True)  # setzt intern auch is_approved = True
+        user = db.get_user_by_twitch_id(user["twitch_id"])
+    if user["twitch_id"] in BOOTSTRAP_SUPPORTER_TWITCH_IDS and not user["is_supporter"]:
+        db.set_supporter(user["id"], True)
         user = db.get_user_by_twitch_id(user["twitch_id"])
 
     st.session_state["auth_user"] = user
