@@ -28,6 +28,12 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db() -> None:
     """Legt die Tabelle an, falls sie noch nicht existiert. Mehrfacher Aufruf ist unkritisch."""
     with _connect() as conn:
@@ -46,21 +52,24 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_wishes_user ON wishes (user_id)")
+        _ensure_column(conn, "wishes", "image_url", "TEXT DEFAULT ''")
         conn.commit()
 
 
-def add_wish(user_id: int, card_id: str, card_name: str, rarity: str = "", note: str = "") -> None:
+def add_wish(user_id: int, card_id: str, card_name: str, rarity: str = "", note: str = "",
+             image_url: str = "") -> None:
     """Setzt eine Karte auf die eigene Wunschliste. Steht die Karte schon drauf, wird nur
     die Notiz aktualisiert (kein doppelter Eintrag, siehe UNIQUE-Constraint)."""
     if not card_id or not card_name:
         return
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO wishes (user_id, card_id, card_name, rarity, note, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(user_id, card_id) DO UPDATE SET note = excluded.note",
+            "INSERT INTO wishes (user_id, card_id, card_name, rarity, note, created_at, image_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, card_id) DO UPDATE SET note = excluded.note, "
+            "image_url = excluded.image_url",
             (user_id, card_id, card_name, rarity, note.strip(),
-             datetime.now().isoformat(timespec="seconds")),
+             datetime.now().isoformat(timespec="seconds"), image_url or ""),
         )
         conn.commit()
 
