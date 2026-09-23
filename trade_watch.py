@@ -20,8 +20,9 @@ import notifications
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_watch.db")
 
-# Muss zur Auto-Refresh-Rate im Frontend passen (siehe render_auto_refresh() in der App).
-CHECK_INTERVAL_SECONDS = 300
+# Muss zur Auto-Refresh-Rate im Frontend passen (siehe _background_trade_check() in der App,
+# läuft als Streamlit-Fragment mit run_every=5 - komplett ohne Seiten-Reload).
+CHECK_INTERVAL_SECONDS = 5
 
 
 def _connect() -> sqlite3.Connection:
