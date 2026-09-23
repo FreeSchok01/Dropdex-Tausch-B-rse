@@ -32,6 +32,12 @@ Tabelle `sessions` ("eingeloggt bleiben" über ?session=... in der URL):
     twitch_id           TEXT             (-> users.twitch_id)
     created_at          TEXT (ISO-Zeitstempel, UTC)
     expires_at          TEXT (ISO-Zeitstempel, UTC; nach SESSION_TTL_DAYS abgelaufen)
+
+Tabelle `favorites` (Favoriten-Schnellauswahl je Account, siehe profile_picker()):
+    user_id             INTEGER          (-> users.id)
+    profile_url         TEXT             (Schlüssel wie in name_map/dropdex_namen.json)
+    profile_name        TEXT             (Anzeigename zum Zeitpunkt des Favorisierens)
+    created_at          TEXT (ISO-Zeitstempel, UTC)
 """
 
 import secrets
@@ -121,6 +127,18 @@ def init_db() -> None:
                 twitch_id   TEXT NOT NULL,
                 created_at  TEXT NOT NULL,
                 expires_at  TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id       INTEGER NOT NULL,
+                profile_url   TEXT NOT NULL,
+                profile_name  TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (user_id, profile_url)
             )
             """
         )
@@ -336,3 +354,48 @@ def delete_expired_sessions() -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
+
+
+# ---------------------------------------------------------------------------
+# Favoriten (Schnellauswahl je Account, siehe profile_picker() in der App)
+# ---------------------------------------------------------------------------
+
+def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
+    """Merkt sich `profile_url` als Favorit für `user_id`. Erneutes Favorisieren
+    aktualisiert nur den gespeicherten Namen (z.B. falls er sich geändert hat)."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO favorites (user_id, profile_url, profile_name, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
+            (user_id, profile_url.strip(), profile_name.strip(), now),
+        )
+
+
+def remove_favorite(user_id: int, profile_url: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?",
+            (user_id, profile_url.strip()),
+        )
+
+
+def is_favorite(user_id: int, profile_url: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?",
+            (user_id, profile_url.strip()),
+        ).fetchone()
+        return row is not None
+
+
+def get_favorites(user_id: int) -> List[Dict[str, Any]]:
+    """Alle Favoriten von `user_id`, alphabetisch nach Name - für die Favoriten-
+    Schnellauswahl in profile_picker()."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
