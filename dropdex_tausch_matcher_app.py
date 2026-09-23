@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 Dropdex P2P Tausch-Matcher
@@ -4363,40 +4364,53 @@ def _admin_append_scan() -> None:
     st.session_state["admin_bulk"] = (cur + "\n" if cur else "") + "\n".join(lines)
 
 
-def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
-    """Bereich (passwortgeschützt): viele Profile (Name + URL) auf einmal hinzufügen, sichern.
-    Alles landet dauerhaft in dropdex_namen.json und steht danach überall als Auswahl/Partner
-    bereit. Löschen (🗑️) ist hier bewusst nur für echte Admins sichtbar - Supporter dürfen
-    Profile hinzufügen/aktualisieren, aber keine löschen (siehe _admin_delete_profiles())."""
+def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any],
+                        require_password: bool = True, as_expander: bool = True) -> None:
+    """Profile (Name + URL) auf einmal hinzufügen, ggf. löschen, sichern. Alles landet dauerhaft
+    in dropdex_namen.json und steht danach überall als Auswahl/Partner bereit.
+
+    Löschen (🗑️) ist hier bewusst nur für echte Admins sichtbar - Supporter dürfen Profile
+    hinzufügen/aktualisieren, aber keine löschen (siehe _admin_delete_profiles()).
+
+    `require_password` schaltet das zusätzliche Passwort-Login davor an/aus - im Admin-Reiter
+    steht der Nutzer ja schon per Twitch-Login + is_admin fest, das Passwort ist hier nur ein
+    zusätzliches Sicherheitsnetz. Im Supporter-Reiter ist der Nutzer über is_supporter genauso
+    fest zugeordnet, daher braucht es dort kein zweites Passwort mehr (`require_password=False`).
+
+    `as_expander` steuert nur die Optik: True = wie bisher ein zuklappbares "🔐 Admin ·
+    Profile verwalten"-Panel; False = offen wie das Moderations-Dashboard direkt angezeigt
+    (kein Aufklapp-Ding), passend zum Supporter-Reiter."""
     can_delete = bool(user.get("is_admin"))
-    panel_title = "🔐 Admin · Profile verwalten" if can_delete else "🧡 Supporter · Profile hinzufügen"
-    with st.expander(panel_title, expanded=False):
+    panel_title = "🔐 Admin · Profile verwalten" if can_delete else "🧡 Supporter · Profile verwalten"
+
+    def _body() -> None:
         st.markdown(auth_ui.ADMIN_CSS, unsafe_allow_html=True)
 
-        pw = get_admin_password()
-        if not pw:
-            st.info(
-                "Der Admin-Zugang ist noch nicht eingerichtet. Lege ein Passwort fest – lokal in der Datei "
-                "`.streamlit/secrets.toml` (oder als Umgebungsvariable `DROPDEX_ADMIN_PASSWORD`), auf "
-                "Streamlit Cloud unter *Settings → Secrets*:"
-            )
-            st.code('ADMIN_PASSWORD = "dein-passwort"', language="toml")
-            return
+        if require_password:
+            pw = get_admin_password()
+            if not pw:
+                st.info(
+                    "Der Admin-Zugang ist noch nicht eingerichtet. Lege ein Passwort fest – lokal in der Datei "
+                    "`.streamlit/secrets.toml` (oder als Umgebungsvariable `DROPDEX_ADMIN_PASSWORD`), auf "
+                    "Streamlit Cloud unter *Settings → Secrets*:"
+                )
+                st.code('ADMIN_PASSWORD = "dein-passwort"', language="toml")
+                return
 
-        if not st.session_state.get("is_admin"):
-            st.markdown('<div class="admin-detail-card">', unsafe_allow_html=True)
-            st.markdown('<div style="font-size:2rem;">🔐</div>', unsafe_allow_html=True)
-            st.markdown('<div class="admin-detail-name">Profile verwalten</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-            entered = st.text_input("Admin-Passwort", type="password", key="admin_pw", label_visibility="collapsed",
-                                     placeholder="🔑 Admin-Passwort")
-            if st.button("Anmelden", key="admin_login", type="primary", use_container_width=True):
-                if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
-                    st.session_state["is_admin"] = True
-                    st.rerun()
-                else:
-                    st.error("Falsches Passwort.")
-            return
+            if not st.session_state.get("is_admin"):
+                st.markdown('<div class="admin-detail-card">', unsafe_allow_html=True)
+                st.markdown('<div style="font-size:2rem;">🔐</div>', unsafe_allow_html=True)
+                st.markdown('<div class="admin-detail-name">Profile verwalten</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+                entered = st.text_input("Admin-Passwort", type="password", key="admin_pw", label_visibility="collapsed",
+                                         placeholder="🔑 Admin-Passwort")
+                if st.button("Anmelden", key="admin_login", type="primary", use_container_width=True):
+                    if hmac.compare_digest(entered.encode("utf-8"), pw.encode("utf-8")):
+                        st.session_state["is_admin"] = True
+                        st.rerun()
+                    else:
+                        st.error("Falsches Passwort.")
+                return
 
         nav_col, list_col = st.columns([1, 3.3])
 
@@ -4404,9 +4418,10 @@ def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
             st.markdown('<div class="admin-nav-title">Bereich</div>', unsafe_allow_html=True)
             st.button("👥 Profile", key="admin_nav_profiles_noop", use_container_width=True,
                       type="primary", disabled=True)
-            if st.button("↩️ Abmelden", key="admin_logout", use_container_width=True):
-                st.session_state["is_admin"] = False
-                st.rerun()
+            if require_password:
+                if st.button("↩️ Abmelden", key="admin_logout", use_container_width=True):
+                    st.session_state["is_admin"] = False
+                    st.rerun()
 
         with list_col:
             st.markdown(
@@ -4538,6 +4553,15 @@ def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
                         f"    {json.dumps(u)}: {json.dumps(n, ensure_ascii=False)},\n"
                         for u, n in sorted(name_map.items(), key=lambda kv: kv[1].lower())) + "}", language="python")
 
+    if as_expander:
+        with st.expander(panel_title, expanded=False):
+            _body()
+    else:
+        # Wie das Moderations-Dashboard: kein Aufklapp-Ding, direkt offen angezeigt.
+        st.markdown(f'<div class="section-title">{panel_title}</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            _body()
+
 
 def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], user: Dict[str, Any]) -> None:
     """Bereich „🔄 1:1 Tausch“: Spieler 1 ist immer automatisch das eigene, hinterlegte Profil;
@@ -4668,11 +4692,15 @@ def render_admin_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
 def render_supporter_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
     """Bereich „🧡 Supporter“: eigener, von „🛠️ Admin“ getrennter Reiter für Supporter.
     auth_ui.render_admin_dashboard() regelt intern bereits, welche Aktionen (Freigeben/Bannen)
-    ein Supporter im Vergleich zu einem Admin darf (siehe _can_ban() in auth_ui.py). Im
-    Profil-Bereich dürfen Supporter Profile hinzufügen, aber nicht löschen - siehe
-    render_admin_panel()."""
+    ein Supporter im Vergleich zu einem Admin darf (siehe _can_ban() in auth_ui.py).
+
+    Der Profil-Bereich wird hier bewusst NICHT als zuklappbares "Aufklapp-Ding" gezeigt,
+    sondern offen wie das Moderations-Dashboard (as_expander=False) - und ohne zusätzliches
+    Passwort (require_password=False), da der Supporter ja schon über seinen Twitch-Login +
+    is_supporter eindeutig feststeht. Supporter dürfen Profile hinzufügen, aber nicht löschen
+    - siehe render_admin_panel()."""
     auth_ui.render_admin_dashboard()
-    render_admin_panel(name_map, user)
+    render_admin_panel(name_map, user, require_password=False, as_expander=False)
 
 
 def render_wishlist_tab(user: Dict[str, Any]) -> None:
