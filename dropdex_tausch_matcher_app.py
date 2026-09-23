@@ -4947,52 +4947,42 @@ def render_chat_tab(user: Dict[str, Any]) -> None:
 
 
 def render_news_tab(user: Dict[str, Any]) -> None:
-    """Bereich „🔔 News“: zeigt alle Tausch-Benachrichtigungen des eingeloggten Nutzers –
-    eine Nachricht landet hier, sobald irgendwo ein Tausch per „✅ Als getauscht markieren“
-    bestätigt wurde."""
+    """Bereich „🔔 News“: zeigt nur die noch UNGELESENEN Nachrichten des eingeloggten Nutzers.
+    Sobald eine Nachricht als gelesen markiert wird (einzeln per „✓“ oder komplett per
+    „Alle als gelesen markieren“), verschwindet sie sofort aus der Liste, statt wie vorher nur
+    ausgegraut stehen zu bleiben."""
     st.markdown('<div class="section-title">🔔 News</div>', unsafe_allow_html=True)
-    items = notifications.get_notifications(user["id"])
-    unread = [n for n in items if not n["is_read"]]
+    items = [n for n in notifications.get_notifications(user["id"]) if not n["is_read"]]
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="panel-hint">{len(unread)} ungelesen von {len(items)} Nachrichten insgesamt.</div>',
+        f'<div class="panel-hint">{len(items)} neue Nachricht{"en" if len(items) != 1 else ""}.</div>',
         unsafe_allow_html=True,
     )
-    if unread and st.button("✅ Alle als gelesen markieren", key="news_mark_all"):
+    if items and st.button("✅ Alle als gelesen markieren", key="news_mark_all"):
         notifications.mark_all_read(user["id"])
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     if not items:
-        st.info("Noch keine Nachrichten. Sobald du einen Tausch mit „✅ Als getauscht markieren“ "
-                 "bestätigst, taucht er hier auf.")
+        st.info("Keine neuen Nachrichten. Sobald du eine neue Karte bekommst, taucht sie hier auf.")
         return
 
     for n in items:
         ts = n["created_at"].replace("T", " ")
-        if n["is_read"]:
+        col_msg, col_btn = st.columns([5, 1])
+        with col_msg:
             st.markdown(
-                f'<div class="trade-card" style="opacity:0.6;">'
+                f'<div class="trade-card" style="border-color:#7c3aed;">'
                 f'<div class="trade-meta" style="text-align:left; flex:1;">'
-                f'<span class="trade-count">{html_lib.escape(ts)}</span><br/>'
+                f'<span class="trade-count">{html_lib.escape(ts)} · 🔔 neu</span><br/>'
                 f'<span class="trade-owner">{n["message"]}</span></div></div>',
                 unsafe_allow_html=True,
             )
-        else:
-            col_msg, col_btn = st.columns([5, 1])
-            with col_msg:
-                st.markdown(
-                    f'<div class="trade-card" style="border-color:#7c3aed;">'
-                    f'<div class="trade-meta" style="text-align:left; flex:1;">'
-                    f'<span class="trade-count">{html_lib.escape(ts)} · 🔔 neu</span><br/>'
-                    f'<span class="trade-owner">{n["message"]}</span></div></div>',
-                    unsafe_allow_html=True,
-                )
-            with col_btn:
-                if st.button("✓", key=f"news_read_{n['id']}", help="Als gelesen markieren"):
-                    notifications.mark_read(n["id"])
-                    st.rerun()
+        with col_btn:
+            if st.button("✓", key=f"news_read_{n['id']}", help="Als gelesen markieren"):
+                notifications.mark_read(n["id"])
+                st.rerun()
 
 
 SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
