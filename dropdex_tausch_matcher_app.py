@@ -4630,10 +4630,31 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
 
     with col_mine:
         st.markdown('<div class="panel">', unsafe_allow_html=True)
-        st.markdown('<div class="panel-label">➕ Karte auf meine Wunschliste setzen</div>',
+        st.markdown('<div class="panel-label">➕ Fehlende Karte auf meine Wunschliste setzen</div>',
                     unsafe_allow_html=True)
 
+        # Genau wie in „👤 Mein Profil“: eigenes Profil automatisch (nach)laden, damit hier
+        # IMMER die echten fehlenden Karten mit echtem Namen zur Auswahl stehen - unabhängig
+        # davon, ob „Mein Profil“ in dieser Sitzung schon geöffnet wurde.
+        own_url = (user.get("own_profile_url") or "").strip()
+        if "myprofile_inv" not in st.session_state and own_url:
+            with st.spinner("Lade dein Dropdex-Profil, um deine fehlenden Karten zu ermitteln …"):
+                try:
+                    loaded = load_my_full_profile(own_url)
+                except Exception:  # noqa: BLE001
+                    loaded = None
+            if loaded:
+                st.session_state["myprofile_inv"] = loaded
+
         my_inv = st.session_state.get("myprofile_inv")
+        if not my_inv and not own_url:
+            st.warning(
+                "Hinterlege zuerst dein eigenes Dropdex-Profil unter „👤 Mein Profil“ - erst dann "
+                "kann hier ermittelt werden, welche echten Karten dir wirklich fehlen."
+            )
+        elif not my_inv:
+            st.error("Dein Profil konnte nicht geladen werden - versuche es über „👤 Mein Profil“ "
+                      "per „🔄 Profil neu laden“ erneut.")
         if my_inv:
             missing = sorted(
                 (c for c in my_inv if c["count"] == 0),
@@ -4655,22 +4676,12 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
                                        picked.get("rarity", ""))
                     st.rerun()
                 st.markdown(
-                    '<div class="panel-hint">Vorschläge stammen aus deinem zuletzt geladenen '
-                    'Profil („👤 Mein Profil“) - nur Karten, die dir dort fehlen.</div>',
+                    f'<div class="panel-hint">{len(missing)} echte fehlende Karten aus deinem '
+                    'Profil zur Auswahl.</div>',
                     unsafe_allow_html=True,
                 )
             else:
-                st.caption("Laut deinem zuletzt geladenen Profil fehlt dir aktuell keine Karte 🎉")
-        else:
-            st.caption("Lade zuerst dein Profil unter „👤 Mein Profil“, um fehlende Karten "
-                       "bequem per Klick hinzuzufügen - oder trage unten eine Karte manuell ein.")
-
-        with st.expander("✏️ Karte manuell eintragen", expanded=not my_inv):
-            name = st.text_input("Kartenname", key="wish_manual_name", placeholder="z. B. Pixel-Panda")
-            rarity = st.selectbox("Seltenheit", list(RARITY_ORDER.keys()), key="wish_manual_rarity")
-            if st.button("📋 Manuell hinzufügen", key="wish_manual_add", disabled=not name.strip()):
-                wishlist.add_wish(user["id"], f"manual:{name.strip().lower()}", name.strip(), rarity)
-                st.rerun()
+                st.caption("Laut deinem Profil fehlt dir aktuell keine Karte 🎉")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
