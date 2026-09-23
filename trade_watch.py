@@ -3,18 +3,20 @@
 trade_watch.py
 ===============
 Beobachtet das eigene Dropdex-Profil im Hintergrund: merkt sich je Karte die zuletzt
-bekannte Anzahl. Ist eine Karte beim nächsten Check weniger geworden (abgegeben) oder
-mehr geworden (neu erhalten), legen wir automatisch eine Nachricht im "🔔 News"-Reiter
-an (siehe notifications.py).
+bekannte Anzahl. Taucht eine Karte auf, die man vorher wirklich noch NIE besessen hat
+(×0 -> ×1+), legen wir automatisch eine Nachricht im "🔔 News"-Reiter an (siehe
+notifications.py). Dubletten (man hatte schon welche, hat jetzt noch mehr) und
+abgegebene Karten erzeugen bewusst KEINE News mehr - sie laufen nur noch intern mit,
+damit der Tauschpartner-Abgleich unten funktioniert.
 
-Zusätzlich versucht das System, bei einem erkannten Wechsel automatisch den
-Tauschpartner zu ermitteln: verliert Nutzer A Karte X und bekommt kurz danach ein
-ANDERER beobachteter Nutzer B genau diese Karte X dazu (oder umgekehrt), gilt das als
-Match - beide News-Einträge werden dann automatisch um den Namen des jeweils anderen
-ergänzt (siehe _try_match_partner() / _record_event()). Das ist ein Best-Effort-
-Abgleich: er klappt nur, wenn beide Beteiligten hier registriert sind UND ihr eigenes
-Profil hinterlegt haben (own_profile_url in db.py), da nur dann überhaupt beobachtet
-wird - ohne Match gibt's trotzdem die normale Nachricht, nur eben ohne Partnername.
+Zusätzlich versucht das System, bei einer neuen Karte automatisch den Tauschpartner zu
+ermitteln: verliert Nutzer A eine Karte X und bekommt kurz danach ein ANDERER
+beobachteter Nutzer B genau diese Karte X als echte neue Karte, gilt das als Match -
+B's News-Eintrag wird dann automatisch um A's Namen ergänzt (siehe _try_match_partner()
+/ _record_event()). Das ist ein Best-Effort-Abgleich: er klappt nur, wenn beide
+Beteiligten hier registriert sind UND ihr eigenes Profil hinterlegt haben
+(own_profile_url in db.py), da nur dann überhaupt beobachtet wird - ohne Match gibt's
+trotzdem die normale "Neue Karte erhalten"-Nachricht, nur eben ohne Partnername.
 
 Eigene, kleine SQLite-Datei – unabhängig von db.py, damit hier nichts am
 bestehenden Datenbank-Schema geändert werden muss.
@@ -131,16 +133,10 @@ def _has_synced_before(user_id: int) -> bool:
         return row is not None
 
 
-def _format_message(direction: str, card_name: str, cur_count: int, prev_count: int,
-                     partner_name: Optional[str] = None) -> str:
-    """Baut den News-Text - mit Tauschpartner, sobald einer gefunden wurde
-    (siehe _try_match_partner()), sonst ohne."""
-    if direction == "lost":
-        wer = f" an {partner_name}" if partner_name else ""
-        if cur_count == 0:
-            return f"🔄 Tausch erfolgreich: {card_name} abgegeben{wer} (vorher ×{prev_count})."
-        return f"🔄 Tausch erfolgreich: Dublette von {card_name} abgegeben{wer} (jetzt noch ×{cur_count})."
-    # direction == "gained"
+def _format_new_card_message(card_name: str, cur_count: int, partner_name: Optional[str] = None) -> str:
+    """Baut den News-Text für eine ECHTE neue Karte (vorher ×0). Dubletten und abgegebene
+    Karten tauchen bewusst NICHT mehr in den News auf (siehe _record_event()) - intern
+    laufen sie aber weiter mit, damit der Tauschpartner-Abgleich funktioniert."""
     von = f" von {partner_name}" if partner_name else ""
     return f"🆕 Neue Karte erhalten{von}: {card_name} (jetzt ×{cur_count})."
 
@@ -162,11 +158,20 @@ def _try_match_partner(user_id: int, card_id: str, direction: str) -> Optional[D
 
 def _record_event(user_id: int, card_id: str, card_name: str, rarity: str, direction: str,
                    cur_count: int, prev_count: int) -> None:
-    """Legt für einen erkannten Wechsel eine News-Nachricht an, versucht sofort einen
-    Tauschpartner zu finden (siehe _try_match_partner()) und aktualisiert bei einem Treffer
-    BEIDE News-Einträge nachträglich um den jeweils anderen Namen (siehe
-    notifications.update_message())."""
+    """Verarbeitet einen erkannten Wechsel. Nur eine ECHTE neue Karte (direction == 'gained'
+    UND prev_count == 0, d.h. man hatte vorher wirklich keine einzige davon) erzeugt eine
+    News-Nachricht. Dubletten (gained mit prev_count > 0) und abgegebene Karten (lost) laufen
+    NICHT mehr in den News auf, sondern nur noch intern als trade_events mit, damit der
+    Tauschpartner-Abgleich (_try_match_partner()) weiterhin funktioniert: verliert A eine Karte
+    und bekommt B sie kurz danach als echte neue Karte, wird B's Nachricht automatisch um
+    A's Namen ergänzt."""
+    is_new_card = direction == "gained" and prev_count == 0
     now = datetime.now().isoformat(timespec="seconds")
+
+    # Dubletten (gained, prev_count > 0) interessieren niemanden mehr - dafür weder News
+    # noch Partner-Abgleich, damit sie auch keinen echten späteren Match "verbrauchen".
+    if direction == "gained" and not is_new_card:
+        return
 
     partner_row = _try_match_partner(user_id, card_id, direction)
     partner_name = None
@@ -174,8 +179,10 @@ def _record_event(user_id: int, card_id: str, card_name: str, rarity: str, direc
         partner_user = db.get_user_by_id(partner_row["user_id"])
         partner_name = partner_user["twitch_username"] if partner_user else None
 
-    msg = _format_message(direction, card_name, cur_count, prev_count, partner_name)
-    notif_id = notifications.add_notification(user_id, msg)
+    notif_id = None
+    if is_new_card:
+        msg = _format_new_card_message(card_name, cur_count, partner_name)
+        notif_id = notifications.add_notification(user_id, msg)
 
     with _connect() as conn:
         conn.execute(
@@ -189,14 +196,13 @@ def _record_event(user_id: int, card_id: str, card_name: str, rarity: str, direc
             conn.execute("UPDATE trade_events SET matched = 1 WHERE id = ?", (partner_row["id"],))
         conn.commit()
 
-    # Treffer: der wartende Gegenpart bekommt jetzt auch nachträglich unseren Namen in
-    # SEINE (schon existierende) News-Nachricht eingetragen.
+    # Treffer: der wartende Gegenpart hatte selbst schon eine "neue Karte"-Nachricht (nur die
+    # gibt es ja noch) - die wird jetzt nachträglich um unseren Namen ergänzt.
     if partner_row and partner_row.get("notification_id"):
         current_user = db.get_user_by_id(user_id)
         current_name = current_user["twitch_username"] if current_user else None
-        partner_msg = _format_message(
-            partner_row["direction"], partner_row["card_name"],
-            partner_row["cur_count"], partner_row["prev_count"], current_name,
+        partner_msg = _format_new_card_message(
+            partner_row["card_name"], partner_row["cur_count"], current_name,
         )
         notifications.update_message(partner_row["notification_id"], partner_msg)
 
