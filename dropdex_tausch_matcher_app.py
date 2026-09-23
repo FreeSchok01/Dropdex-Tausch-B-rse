@@ -28,6 +28,7 @@ import html as html_lib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +41,7 @@ import chat  # eigenständiges Mini-Modul für den "💬 Chat"-Reiter (siehe cha
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
 import trade_watch  # beobachtet das eigene Profil alle 10s auf verschwundene Karten (siehe trade_watch.py)
+import wishlist  # eigenständiges Mini-Modul für das öffentliche "📋 Ich suche"-Board (siehe wishlist.py)
 import streamlit.components.v1 as components
 
 # ----------------------------------------------------------------------------
@@ -4031,6 +4033,33 @@ def render_diagnostics(result: Dict[str, Any], p1_label: str = "Spieler 1", p2_l
             st.code("\n".join(info.get("preview", [])[:120]) or "(leer)")
 
 
+# Innerhalb dieser Zeitspanne seit dem letzten Seitenaufruf gilt ein Account als "online".
+ONLINE_THRESHOLD_SECONDS = 5 * 60
+
+
+def online_status_html(last_seen: Optional[str]) -> str:
+    """Kleiner grüner/grauer Punkt + Text für den Online-Status in der Chat-Liste, basierend
+    auf users.last_seen (siehe db.touch_last_seen(), wird bei jedem Seitenaufruf gesetzt)."""
+    if not last_seen:
+        return '<span style="opacity:0.55;">⚪ nie aktiv</span>'
+    try:
+        seen_at = datetime.fromisoformat(last_seen)
+    except ValueError:
+        return '<span style="opacity:0.55;">⚪ unbekannt</span>'
+    now = datetime.now(timezone.utc) if seen_at.tzinfo else datetime.utcnow()
+    delta_s = max(0, (now - seen_at).total_seconds())
+    if delta_s <= ONLINE_THRESHOLD_SECONDS:
+        return '<span style="color:#3ecf72;">🟢 online</span>'
+    minutes = int(delta_s // 60)
+    if minutes < 60:
+        text = f"vor {minutes} Min." if minutes else "gerade eben"
+    elif minutes < 60 * 24:
+        text = f"vor {minutes // 60} Std."
+    else:
+        text = f"vor {minutes // (60 * 24)} Tg."
+    return f'<span style="opacity:0.55;">⚪ {html_lib.escape(text)}</span>'
+
+
 def stat_card(label: str, value: str, extra: str = "") -> str:
     extra_html = f'<div class="stat-extra">{html_lib.escape(extra)}</div>' if extra else ""
     return (
@@ -4591,6 +4620,148 @@ def render_admin_tab(name_map: Dict[str, str]) -> None:
     render_admin_panel(name_map)
 
 
+def render_wishlist_tab(user: Dict[str, Any]) -> None:
+    """Bereich „📋 Ich suche“: öffentliches Wunschlisten-Board. Jeder kann Karten, die ihm
+    fehlen, draufsetzen - andere sehen das Board und können direkt über den bestehenden
+    Chat (siehe chat.py) anschreiben, statt aktiv nach "Wer hat Karte X" suchen zu müssen."""
+    st.markdown('<div class="section-title">📋 Ich suche</div>', unsafe_allow_html=True)
+
+    col_mine, col_board = st.columns([2, 3])
+
+    with col_mine:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">➕ Karte auf meine Wunschliste setzen</div>',
+                    unsafe_allow_html=True)
+
+        my_inv = st.session_state.get("myprofile_inv")
+        if my_inv:
+            missing = sorted(
+                (c for c in my_inv if c["count"] == 0),
+                key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("name", "").lower()),
+            )
+            if missing:
+                already_ids = {w["card_id"] for w in wishlist.get_my_wishes(user["id"])}
+                options = {
+                    f'{RARITY_LABEL_DE.get(c["rarity"], c["rarity"])} · {c.get("name", "")}'
+                    + (" (schon auf der Liste)" if str(c["id"]) in already_ids else ""): c
+                    for c in missing
+                }
+                choice = st.selectbox("Fehlende Karte wählen", list(options.keys()),
+                                       key="wish_pick", label_visibility="collapsed")
+                picked = options[choice]
+                if st.button("📋 Zur Wunschliste hinzufügen", key="wish_add_btn",
+                             disabled=str(picked["id"]) in already_ids, use_container_width=True):
+                    wishlist.add_wish(user["id"], str(picked["id"]), picked.get("name", ""),
+                                       picked.get("rarity", ""))
+                    st.rerun()
+                st.markdown(
+                    '<div class="panel-hint">Vorschläge stammen aus deinem zuletzt geladenen '
+                    'Profil („👤 Mein Profil“) - nur Karten, die dir dort fehlen.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Laut deinem zuletzt geladenen Profil fehlt dir aktuell keine Karte 🎉")
+        else:
+            st.caption("Lade zuerst dein Profil unter „👤 Mein Profil“, um fehlende Karten "
+                       "bequem per Klick hinzuzufügen - oder trage unten eine Karte manuell ein.")
+
+        with st.expander("✏️ Karte manuell eintragen", expanded=not my_inv):
+            name = st.text_input("Kartenname", key="wish_manual_name", placeholder="z. B. Pixel-Panda")
+            rarity = st.selectbox("Seltenheit", list(RARITY_ORDER.keys()), key="wish_manual_rarity")
+            if st.button("📋 Manuell hinzufügen", key="wish_manual_add", disabled=not name.strip()):
+                wishlist.add_wish(user["id"], f"manual:{name.strip().lower()}", name.strip(), rarity)
+                st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">📄 Meine Wunschliste</div>', unsafe_allow_html=True)
+        mine = wishlist.get_my_wishes(user["id"])
+        if not mine:
+            st.caption("Noch keine Wünsche eingetragen.")
+        for w in mine:
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                st.markdown(
+                    f'<span style="opacity:0.8;">{RARITY_LABEL_DE.get(w["rarity"], w["rarity"] or "")}</span> '
+                    f'· {html_lib.escape(w["card_name"])}',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button("🗑️", key=f"wish_del_{w['id']}", help="Von der Wunschliste entfernen"):
+                    wishlist.remove_wish(user["id"], w["id"])
+                    st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col_board:
+        st.markdown('<div class="panel-label">🌐 Öffentliches Board - wer sucht was?</div>',
+                    unsafe_allow_html=True)
+        board = wishlist.get_board(exclude_user_id=user["id"])
+        if not board:
+            st.info("Aktuell hat noch niemand etwas auf die Wunschliste gesetzt.")
+            return
+        for w in board:
+            wisher = db.get_user_by_id(w["user_id"])
+            wname = wisher["twitch_username"] if wisher else "Unbekannter Nutzer"
+            status = online_status_html(wisher.get("last_seen")) if wisher else ""
+            col_card, col_action = st.columns([4, 1])
+            with col_card:
+                st.markdown(
+                    f'<div class="trade-card">'
+                    f'<div class="trade-meta" style="text-align:left; flex:1;">'
+                    f'<span class="trade-count">{RARITY_LABEL_DE.get(w["rarity"], w["rarity"] or "")} '
+                    f'· {html_lib.escape(w["card_name"])}</span><br/>'
+                    f'<span class="trade-owner">gesucht von 👤 {html_lib.escape(wname)} '
+                    f'&nbsp;·&nbsp; {status}</span></div></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_action:
+                if wisher and st.button("💬", key=f"wish_chat_{w['id']}", help=f"{wname} anschreiben",
+                                         use_container_width=True):
+                    st.session_state["chat_partner_id"] = wisher["id"]
+                    st.session_state["current_page"] = "chat"
+                    st.rerun()
+
+
+def render_leaderboard_tab(user: Dict[str, Any]) -> None:
+    """Bereich „🏆 Bestenliste“: öffentliches Ranking nach Sammelfortschritt, basierend auf
+    dem jeweils neuesten Fortschritts-Schnappschuss je Account (siehe db.progress_snapshots).
+    Jeder Account kann sich per Opt-out aus der Liste ausblenden."""
+    st.markdown('<div class="section-title">🏆 Bestenliste</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    visible = bool(user.get("show_on_leaderboard", 1))
+    new_visible = st.checkbox("Meinen Fortschritt auf der öffentlichen Bestenliste anzeigen",
+                               value=visible, key="leaderboard_optin")
+    if new_visible != visible:
+        db.set_leaderboard_visible(user["id"], new_visible)
+        st.rerun()
+    st.markdown(
+        '<div class="panel-hint">Die Rangliste zeigt jeweils den letzten Stand aus „👤 Mein Profil“ '
+        '- lade dein Profil dort neu, um deinen Rang zu aktualisieren.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    board = db.get_leaderboard(limit=50)
+    if not board:
+        st.info("Noch keine Einträge - lade dein Profil unter „👤 Mein Profil“, um hier zu erscheinen.")
+        return
+
+    rows = []
+    for rank, entry in enumerate(board, start=1):
+        pct = (entry["distinct_owned"] / entry["distinct_total"] * 100) if entry["distinct_total"] else 0.0
+        medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"#{rank}")
+        rows.append({
+            "Rang": medal,
+            "Nutzer": entry["twitch_username"] + ("  (Du)" if entry["user_id"] == user["id"] else ""),
+            "Verschiedene Karten": f'{entry["distinct_owned"]} / {entry["distinct_total"]}',
+            "Fortschritt": f"{pct:.1f} %",
+            "Karten insgesamt": entry["total_copies"],
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 def render_chat_tab(user: Dict[str, Any]) -> None:
     """Bereich „💬 Chat“: direkte 1:1-Nachrichten mit anderen registrierten Accounts.
     Partner werden per Twitch-Username gesucht (unabhängig von Tausch-Matches) - ein
@@ -4617,10 +4788,14 @@ def render_chat_tab(user: Dict[str, Any]) -> None:
             if not results:
                 st.caption("Kein Nutzer mit diesem Namen gefunden.")
             for r in results:
-                if st.button(f"💬 {r['twitch_username']}", key=f"chat_start_{r['id']}",
-                             use_container_width=True):
-                    st.session_state["chat_partner_id"] = r["id"]
-                    st.rerun()
+                col_btn, col_status = st.columns([3, 1])
+                with col_btn:
+                    if st.button(f"💬 {r['twitch_username']}", key=f"chat_start_{r['id']}",
+                                 use_container_width=True):
+                        st.session_state["chat_partner_id"] = r["id"]
+                        st.rerun()
+                with col_status:
+                    st.markdown(online_status_html(r.get("last_seen")), unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -4635,10 +4810,15 @@ def render_chat_tab(user: Dict[str, Any]) -> None:
             pname = partner["twitch_username"] if partner else "Unbekannter Nutzer"
             label = f"👤 {pname}" + (f"  ({c['unread']})" if c["unread"] else "")
             active = st.session_state.get("chat_partner_id") == c["partner_id"]
-            if st.button(label, key=f"chat_convo_{c['partner_id']}", use_container_width=True,
-                         type="primary" if active else "secondary"):
-                st.session_state["chat_partner_id"] = c["partner_id"]
-                st.rerun()
+            col_btn, col_status = st.columns([3, 1])
+            with col_btn:
+                if st.button(label, key=f"chat_convo_{c['partner_id']}", use_container_width=True,
+                             type="primary" if active else "secondary"):
+                    st.session_state["chat_partner_id"] = c["partner_id"]
+                    st.rerun()
+            with col_status:
+                if partner:
+                    st.markdown(online_status_html(partner.get("last_seen")), unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_thread:
@@ -4656,8 +4836,11 @@ def render_chat_tab(user: Dict[str, Any]) -> None:
         # Beim Öffnen der Unterhaltung gelten alle eingehenden Nachrichten als gelesen.
         chat.mark_conversation_read(user["id"], partner_id)
 
-        st.markdown(f'<div class="panel-label">👤 {html_lib.escape(partner["twitch_username"])}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="panel-label">👤 {html_lib.escape(partner["twitch_username"])} '
+            f'&nbsp;·&nbsp; {online_status_html(partner.get("last_seen"))}</div>',
+            unsafe_allow_html=True,
+        )
 
         messages = chat.get_conversation(user["id"], partner_id)
         thread_html = ['<div style="max-height:420px; overflow-y:auto; padding:4px 2px;">']
@@ -4746,6 +4929,8 @@ SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
         ("search", "🔍", "Meine fehlende Karten"),
         ("getrid", "🎯", "Karte loswerden"),
         ("trade", "🔄", "1:1 Tausch"),
+        ("wishlist", "📋", "Ich suche"),
+        ("leaderboard", "🏆", "Bestenliste"),
         ("chat", "💬", "Chat"),
         ("news", "🔔", "News"),
     ]),
@@ -4755,6 +4940,8 @@ SIDEBAR_PAGE_LABELS: Dict[str, str] = {
     "search": "🔍 Meine fehlende Karten",
     "getrid": "🎯 Karte loswerden",
     "trade": "🔄 1:1 Tausch",
+    "wishlist": "📋 Ich suche",
+    "leaderboard": "🏆 Bestenliste",
     "chat": "💬 Chat",
     "news": "🔔 News",
     "admin": "🛠️ Admin",
@@ -4830,7 +5017,9 @@ def main() -> None:
     notifications.init_db()
     trade_watch.init_db()
     chat.init_db()
+    wishlist.init_db()
     user = st.session_state["auth_user"]
+    db.touch_last_seen(user["id"])
 
     # ---- Alle 10s: Seite neu laden + im Hintergrund prüfen, ob eine Karte aus dem eigenen
     # Profil verschwunden ist (= erfolgreich getauscht) -> Nachricht landet automatisch in "🔔 News". ----
@@ -4856,6 +5045,10 @@ def main() -> None:
         render_get_rid_tab(name_map, selected_rarities, user)
     elif page == "🔄 1:1 Tausch":
         render_trade_tab(name_map, selected_rarities, user)
+    elif page == "📋 Ich suche":
+        render_wishlist_tab(user)
+    elif page == "🏆 Bestenliste":
+        render_leaderboard_tab(user)
     elif page == "💬 Chat":
         render_chat_tab(user)
     elif page == "🔔 News":
