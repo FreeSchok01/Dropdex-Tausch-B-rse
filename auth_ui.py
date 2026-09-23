@@ -40,7 +40,7 @@ BOOTSTRAP_ADMIN_TWITCH_IDS: Set[str] = {
 # Supporter statt Admin). Einfach die Twitch-ID hier eintragen.
 # ---------------------------------------------------------------------------
 BOOTSTRAP_SUPPORTER_TWITCH_IDS: Set[str] = {
-     # "DEINE_SUPPORTER_TWITCH_ID_HIER",
+      "564392933",
 }
 
 
