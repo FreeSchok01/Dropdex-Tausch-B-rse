@@ -4034,22 +4034,21 @@ def render_diagnostics(result: Dict[str, Any], p1_label: str = "Spieler 1", p2_l
 
 
 # Innerhalb dieser Zeitspanne seit dem letzten Seitenaufruf gilt ein Account als "online".
-ONLINE_THRESHOLD_SECONDS = 5 * 60
-
-
 def online_status_html(last_seen: Optional[str]) -> str:
     """Kleiner grüner/grauer Punkt + Text für den Online-Status in der Chat-Liste, basierend
-    auf users.last_seen (siehe db.touch_last_seen(), wird bei jedem Seitenaufruf gesetzt)."""
+    auf users.last_seen (siehe db.touch_last_seen(), wird bei jedem Seitenaufruf gesetzt).
+    Nutzt db.is_user_online() als einzige Quelle der Wahrheit (gleiche Schwelle wie im
+    Moderations-Dashboard)."""
     if not last_seen:
         return '<span style="opacity:0.55;">⚪ nie aktiv</span>'
+    if db.is_user_online(last_seen):
+        return '<span style="color:#3ecf72;">🟢 online</span>'
     try:
         seen_at = datetime.fromisoformat(last_seen)
     except ValueError:
         return '<span style="opacity:0.55;">⚪ unbekannt</span>'
     now = datetime.now(timezone.utc) if seen_at.tzinfo else datetime.utcnow()
     delta_s = max(0, (now - seen_at).total_seconds())
-    if delta_s <= ONLINE_THRESHOLD_SECONDS:
-        return '<span style="color:#3ecf72;">🟢 online</span>'
     minutes = int(delta_s // 60)
     if minutes < 60:
         text = f"vor {minutes} Min." if minutes else "gerade eben"
@@ -4673,7 +4672,7 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
                 if st.button("📋 Zur Wunschliste hinzufügen", key="wish_add_btn",
                              disabled=str(picked["id"]) in already_ids, use_container_width=True):
                     wishlist.add_wish(user["id"], str(picked["id"]), picked.get("name", ""),
-                                       picked.get("rarity", ""))
+                                       picked.get("rarity", ""), image_url=picked.get("image_url", ""))
                     st.rerun()
                 st.markdown(
                     f'<div class="panel-hint">{len(missing)} echte fehlende Karten aus deinem '
@@ -4693,9 +4692,10 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
         for w in mine:
             c1, c2 = st.columns([4, 1])
             with c1:
+                thumb_card = {"name": w["card_name"], "image_url": w.get("image_url")}
                 st.markdown(
-                    f'<span style="opacity:0.8;">{RARITY_LABEL_DE.get(w["rarity"], w["rarity"] or "")}</span> '
-                    f'· {html_lib.escape(w["card_name"])}',
+                    f'<div class="trade-card"><div style="display:flex; align-items:center; gap:10px;">'
+                    f'{_card_thumb_html(thumb_card, w["rarity"] or "COMMON")}</div></div>',
                     unsafe_allow_html=True,
                 )
             with c2:
@@ -4715,15 +4715,19 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
             wisher = db.get_user_by_id(w["user_id"])
             wname = wisher["twitch_username"] if wisher else "Unbekannter Nutzer"
             status = online_status_html(wisher.get("last_seen")) if wisher else ""
-            col_card, col_action = st.columns([4, 1])
-            with col_card:
+            thumb_card = {"name": w["card_name"], "image_url": w.get("image_url")}
+            col_thumb, col_meta, col_action = st.columns([1, 3, 1])
+            with col_thumb:
                 st.markdown(
-                    f'<div class="trade-card">'
-                    f'<div class="trade-meta" style="text-align:left; flex:1;">'
-                    f'<span class="trade-count">{RARITY_LABEL_DE.get(w["rarity"], w["rarity"] or "")} '
-                    f'· {html_lib.escape(w["card_name"])}</span><br/>'
+                    f'<div class="trade-card" style="padding:6px;">'
+                    f'{_card_thumb_html(thumb_card, w["rarity"] or "COMMON")}</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_meta:
+                st.markdown(
+                    f'<div style="margin-top:10px;">'
                     f'<span class="trade-owner">gesucht von 👤 {html_lib.escape(wname)} '
-                    f'&nbsp;·&nbsp; {status}</span></div></div>',
+                    f'&nbsp;·&nbsp; {status}</span></div>',
                     unsafe_allow_html=True,
                 )
             with col_action:
@@ -4779,7 +4783,7 @@ def render_chat_tab(user: Dict[str, Any]) -> None:
     Chat funktioniert nur mit Accounts, die selbst eingeloggt sind/waren, nicht mit
     beliebigen, nur über eine Dropdex-Profil-URL bekannten Personen.
     Aktualisierung bewusst NUR manuell über den „🔄 Aktualisieren“-Button (kein
-    zusätzlicher Auto-Refresh-Timer neben render_auto_refresh())."""
+    zusätzlicher Auto-Refresh-Timer neben _background_trade_check())."""
     st.markdown('<div class="section-title">💬 Chat</div>', unsafe_allow_html=True)
 
     col_refresh, _ = st.columns([1, 5])
@@ -4988,21 +4992,15 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
     return SIDEBAR_PAGE_LABELS[st.session_state["current_page"]]
 
 
-def render_auto_refresh() -> None:
-    """Lädt die Seite alle `trade_watch.CHECK_INTERVAL_SECONDS` Sekunden automatisch neu
-    (per kleinem JS-Timer in einem unsichtbaren Komponenten-Frame). So läuft bei jedem
-    Reload auch der Hintergrund-Check in trade_watch.maybe_check() erneut an – ganz ohne
-    zusätzliche Bibliothek."""
-    components.html(
-        f"""
-        <script>
-        setTimeout(function() {{
-            window.parent.location.reload();
-        }}, {trade_watch.CHECK_INTERVAL_SECONDS * 1000});
-        </script>
-        """,
-        height=0,
-    )
+@st.fragment(run_every=5)
+def _background_trade_check(user_id: int, own_url: str) -> None:
+    """Prüft alle 5 Sekunden im Hintergrund, ob sich am eigenen Kartenprofil etwas verändert
+    hat (siehe trade_watch.maybe_check()). Läuft als eigenständiges Streamlit-Fragment: NUR
+    dieser kleine Codeblock wird alle 5s neu ausgeführt, NICHT die komplette Seite - anders
+    als beim alten JS-`window.location.reload()`-Timer gibt es dadurch nie einen echten
+    Seiten-Reload (keine verlorene Eingabe, kein Scroll-Sprung, kein Tab-Wechsel-Reset)."""
+    if own_url:
+        trade_watch.maybe_check(user_id, lambda: load_my_full_profile(own_url))
 
 
 def main() -> None:
@@ -5032,12 +5030,11 @@ def main() -> None:
     user = st.session_state["auth_user"]
     db.touch_last_seen(user["id"])
 
-    # ---- Alle 10s: Seite neu laden + im Hintergrund prüfen, ob eine Karte aus dem eigenen
-    # Profil verschwunden ist (= erfolgreich getauscht) -> Nachricht landet automatisch in "🔔 News". ----
-    render_auto_refresh()
+    # ---- Alle 5s im Hintergrund prüfen, ob eine Karte aus dem eigenen Profil verschwunden
+    # ist (= erfolgreich getauscht) -> Nachricht landet automatisch in "🔔 News". Läuft als
+    # Fragment (siehe _background_trade_check()) OHNE die Seite neu zu laden. ----
     own_url = (user.get("own_profile_url") or "").strip()
-    if own_url:
-        trade_watch.maybe_check(user["id"], lambda: load_my_full_profile(own_url))
+    _background_trade_check(user["id"], own_url)
 
     name_map = load_name_map()
 
