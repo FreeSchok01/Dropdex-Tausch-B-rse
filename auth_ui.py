@@ -212,12 +212,8 @@ def render_login_gate() -> bool:
         st.error("🚫 Dein Account ist für dieses Tool gesperrt.")
         return False
 
-    if not user["is_approved"]:
-        st.warning(
-            "⏳ Dein Account wartet noch auf Freigabe durch einen Admin oder Supporter. "
-            "Schau gleich nochmal vorbei – sobald du freigegeben bist, hast du automatisch Zugriff."
-        )
-        return False
+    # Normale User brauchen keine Bestätigung/Freigabe mehr, um die App zu nutzen (is_approved
+    # wird nur noch informativ im Admin-Dashboard geführt, siehe db.create_user()/init_db()).
 
     # ---- Wartungsmodus: nur Admins kommen durch, alle anderen sehen nur diese
     # Meldung statt der eigentlichen App (siehe maintenance.py + Toggle oben). ----
