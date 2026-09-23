@@ -39,6 +39,7 @@ import streamlit as st
 import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
 import chat  # eigenständiges Mini-Modul für den "💬 Chat"-Reiter (siehe chat.py)
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
+import maintenance  # eigenständiges Mini-Modul für den Wartungsmodus (siehe maintenance.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
 import trade_watch  # beobachtet das eigene Profil alle 10s auf verschwundene Karten (siehe trade_watch.py)
 import wishlist  # eigenständiges Mini-Modul für das öffentliche "📋 Ich suche"-Board (siehe wishlist.py)
@@ -3817,19 +3818,46 @@ def render_search_section(name_map: Dict[str, str], selected_rarities: List[str]
     my_url, my_name = my_profile_picker(user)
     my_norm = normalize_url(my_url) if my_url.strip() else ""
     partners = {u: n for u, n in name_map.items() if normalize_url(u) != my_norm}
+
+    # ---- Bei vielen gespeicherten Profilen (500+) dauert das Laden ALLER Profile sehr lange
+    # (ein HTTP-Request je Profil). Deshalb wählt man hier selbst aus, mit wem verglichen
+    # werden soll, statt dass automatisch jedes Mal alles geladen wird. ----
+    partner_items = sorted(partners.items(), key=lambda kv: kv[1].lower())
+    partner_urls_sorted = [u for u, _ in partner_items]
+    st.markdown('<div class="panel-hint">Mit welchen Profilen soll verglichen werden? Nur ausgewählte '
+                'Profile werden geladen - das hält es bei vielen gespeicherten Profilen schnell.</div>',
+                unsafe_allow_html=True)
+    col_pick, col_all, col_none = st.columns([4, 1, 1])
+    with col_pick:
+        selected_urls = st.multiselect(
+            "Vergleichsprofile", options=partner_urls_sorted,
+            format_func=lambda u: partners.get(u, u), key="search_partner_pick",
+            placeholder=f"Profile auswählen (von {len(partners)} gespeicherten) …",
+            label_visibility="collapsed",
+        )
+    with col_all:
+        if st.button("Alle", key="search_partner_all", use_container_width=True,
+                     help=f"Alle {len(partners)} gespeicherten Profile auswählen (kann dauern)"):
+            st.session_state["search_partner_pick"] = partner_urls_sorted
+            st.rerun()
+    with col_none:
+        if st.button("Keine", key="search_partner_none", use_container_width=True):
+            st.session_state["search_partner_pick"] = []
+            st.rerun()
+    chosen_partners = {u: partners[u] for u in selected_urls}
     st.markdown(
-        f'<div class="panel-hint">Als mögliche Tauschpartner dienen deine {len(partners)} anderen gespeicherten '
-        f'Profile.</div>',
+        f'<div class="panel-hint">{len(chosen_partners)} von {len(partners)} gespeicherten Profilen '
+        f'ausgewählt.</div>',
         unsafe_allow_html=True,
     )
     load_clicked = st.button("📥 Meine fehlenden Karten laden", type="primary", key="search_load",
-                             disabled=not my_url.strip())
+                             disabled=not my_url.strip() or not chosen_partners)
     st.markdown('</div>', unsafe_allow_html=True)
 
     if load_clicked:
         bar = st.progress(0.0, text="Lade Profile …")
         try:
-            pool = load_search_pool(my_url, my_name, partners, lambda f, t: bar.progress(min(f, 1.0), text=t))
+            pool = load_search_pool(my_url, my_name, chosen_partners, lambda f, t: bar.progress(min(f, 1.0), text=t))
         except Exception as e:  # noqa: BLE001
             bar.empty()
             st.session_state.pop("search_pool", None)
@@ -4655,10 +4683,33 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
             st.error("Dein Profil konnte nicht geladen werden - versuche es über „👤 Mein Profil“ "
                       "per „🔄 Profil neu laden“ erneut.")
         if my_inv:
-            missing = sorted(
-                (c for c in my_inv if c["count"] == 0),
-                key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("name", "").lower()),
-            )
+            # WICHTIG: Für Karten, die dir fehlen, liefert dein EIGENES Profil weder einen echten
+            # Namen noch ein Bild (Dropdex zeigt beides nur bei Karten, die man besitzt) - daher
+            # bisher "Karte 10" / "UNKNOWN" / Platzhalter-Emoji. Die echten Namen/Bilder kommen nur
+            # über den Abgleich mit ANDEREN Profilen zustande, genau wie bei „🔍 Meine fehlende
+            # Karten“. Ist dort schon ein Vergleich geladen, nutzen wir dessen Katalog hier mit.
+            pool = st.session_state.get("search_pool")
+            catalog: Dict[str, Dict[str, Any]] = {}
+            if pool:
+                layer = pick_search_layer(pool)
+                if layer:
+                    partner_layer_invs = [p["layers"][layer] for p in pool["partners"].values()
+                                           if layer in p["layers"]]
+                    me_layer_inv = pool["me"].get(layer, my_inv)
+                    catalog = build_card_catalog([me_layer_inv] + partner_layer_invs)
+
+            missing_raw = [c for c in my_inv if c["count"] == 0]
+            missing: List[Dict[str, Any]] = []
+            unresolved_n = 0
+            for c in missing_raw:
+                match = catalog.get(c["id"])
+                if match and match.get("_known"):
+                    missing.append({**c, "name": match["name"], "rarity": match["rarity"],
+                                     "image_url": match.get("image_url")})
+                else:
+                    unresolved_n += 1
+            missing.sort(key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("name", "").lower()))
+
             if missing:
                 already_ids = {w["card_id"] for w in wishlist.get_my_wishes(user["id"])}
                 options = {
@@ -4674,10 +4725,16 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
                     wishlist.add_wish(user["id"], str(picked["id"]), picked.get("name", ""),
                                        picked.get("rarity", ""), image_url=picked.get("image_url", ""))
                     st.rerun()
-                st.markdown(
-                    f'<div class="panel-hint">{len(missing)} echte fehlende Karten aus deinem '
-                    'Profil zur Auswahl.</div>',
-                    unsafe_allow_html=True,
+                hint = f"{len(missing)} echte fehlende Karten mit bekanntem Namen zur Auswahl."
+                if unresolved_n:
+                    hint += (f" {unresolved_n} weitere fehlende Karten sind noch nicht auflösbar - lade dazu "
+                             "ein paar Vergleichsprofile unter „🔍 Meine fehlende Karten“.")
+                st.markdown(f'<div class="panel-hint">{hint}</div>', unsafe_allow_html=True)
+            elif unresolved_n:
+                st.info(
+                    f"Dir fehlen {unresolved_n} Karten, aber ihr echter Name ist noch unbekannt. Lade unter "
+                    "„🔍 Meine fehlende Karten“ ein paar Vergleichsprofile - erst dann kennt die App Name und "
+                    "Bild dieser Karten und du kannst sie hier auf die Wunschliste setzen."
                 )
             else:
                 st.caption("Laut deinem Profil fehlt dir aktuell keine Karte 🎉")
@@ -4993,14 +5050,34 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
 
 
 @st.fragment(run_every=5)
+def _sidebar_nav_fragment(user: Dict[str, Any]) -> str:
+    """Kapselt render_sidebar_nav() als eigenes Fragment, das alle 5s neu ausgeführt wird -
+    dadurch aktualisieren sich die Badge-Zahlen bei "💬 Chat" und "🔔 News" von selbst, sobald
+    im Hintergrund (siehe _background_trade_check()) etwas Neues reinkommt, OHNE dass dafür
+    die ganze Seite neu geladen werden muss. Klicks auf einen Nav-Button lösen weiterhin ganz
+    normal einen kompletten Rerun aus (render_sidebar_nav() ruft dafür explizit st.rerun())."""
+    return render_sidebar_nav(user)
+
+
+@st.fragment(run_every=5)
 def _background_trade_check(user_id: int, own_url: str) -> None:
     """Prüft alle 5 Sekunden im Hintergrund, ob sich am eigenen Kartenprofil etwas verändert
     hat (siehe trade_watch.maybe_check()). Läuft als eigenständiges Streamlit-Fragment: NUR
     dieser kleine Codeblock wird alle 5s neu ausgeführt, NICHT die komplette Seite - anders
     als beim alten JS-`window.location.reload()`-Timer gibt es dadurch nie einen echten
-    Seiten-Reload (keine verlorene Eingabe, kein Scroll-Sprung, kein Tab-Wechsel-Reset)."""
+    Seiten-Reload (keine verlorene Eingabe, kein Scroll-Sprung, kein Tab-Wechsel-Reset).
+
+    Findet der Check eine Veränderung (= neue Nachricht in "🔔 News"), poppt zusätzlich ein
+    Toast auf - so sieht man es direkt auf der Seite, statt erst manuell im News-Tab
+    nachschauen zu müssen."""
     if own_url:
+        before = notifications.unread_count(user_id)
         trade_watch.maybe_check(user_id, lambda: load_my_full_profile(own_url))
+        after = notifications.unread_count(user_id)
+        if after > before:
+            new_items = notifications.get_notifications(user_id, limit=after - before)
+            for n in reversed(new_items):  # älteste zuerst anzeigen
+                st.toast(n["message"], icon="🔔")
 
 
 def main() -> None:
@@ -5038,9 +5115,10 @@ def main() -> None:
 
     name_map = load_name_map()
 
-    # ---- Navigation links (Sidebar), im Stil: Gruppenlabel + Icon-Pills ----
+    # ---- Navigation links (Sidebar), im Stil: Gruppenlabel + Icon-Pills. Läuft als Fragment
+    # (siehe _sidebar_nav_fragment()), damit die Badge-Zahlen alle 5s live mitlaufen. ----
     with st.sidebar:
-        page = render_sidebar_nav(user)
+        page = _sidebar_nav_fragment(user)
 
     # ---- Keine Seltenheiten-Filter-Toolbar mehr: alle Seltenheiten werden immer angezeigt. ----
     selected_rarities: List[str] = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
