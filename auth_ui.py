@@ -241,6 +241,16 @@ ADMIN_CSS = """
     letter-spacing:0.04em; margin-top:12px; }
 .admin-info-value { color:#e2e3f2; font-size:0.9rem; font-weight:600; margin-top:2px; }
 .admin-empty { color:#7d7f97; font-size:0.85rem; padding: 20px 6px; text-align:center; }
+.admin-stats-row { display:flex; gap:14px; margin: 10px 0 18px 0; }
+.admin-stat {
+    flex:1; background: linear-gradient(180deg, #1c1030 0%, #120c1f 100%);
+    border:1px solid #2a2c45; border-radius:14px; padding: 14px 18px;
+}
+.admin-stat-label { color:#8b8d9e; font-size:0.78rem; text-transform:uppercase;
+    letter-spacing:0.04em; margin-bottom:4px; }
+.admin-stat-value { color:#eceef8; font-size:1.6rem; font-weight:800; }
+.admin-stat-value.online { color:#3ecf72; }
+.admin-stat-value.offline { color:#9ca3af; }
 </style>
 """
 
@@ -280,6 +290,14 @@ def _status_badge_html(u: Dict[str, Any]) -> str:
     return '<span class="admin-badge admin-badge-approved">✅ Freigegeben</span>'
 
 
+def _online_dot_html(u: Dict[str, Any]) -> str:
+    """Kleiner grüner/grauer Punkt für den Online-Status in der Admin-Nutzerliste,
+    basierend auf db.is_user_online() (gleiche Schwelle wie im Chat)."""
+    if db.is_user_online(u.get("last_seen")):
+        return '<span title="online" style="color:#3ecf72;">🟢</span>'
+    return '<span title="offline" style="color:#6b6d80;">⚪</span>'
+
+
 def render_admin_dashboard() -> None:
     """Moderations-Dashboard im Stil „Nutzerübersicht / Freigaben / Gesperrt“ mit
     Detail-Panel rechts. Freigeben+Bannen für Admin + Supporter, volle Rechteverwaltung
@@ -293,6 +311,24 @@ def render_admin_dashboard() -> None:
     st.markdown(ADMIN_CSS, unsafe_allow_html=True)
 
     st.markdown('<div class="section-title">🛠️ Moderations-Dashboard</div>', unsafe_allow_html=True)
+
+    # ---- Statistik-Zeile: wie viele Profile gibt es insgesamt und wie viele davon sind
+    # GERADE (siehe db.ONLINE_THRESHOLD_SECONDS) online bzw. offline. ----
+    all_users_stats = db.get_all_users()
+    online_n = sum(1 for u in all_users_stats if db.is_user_online(u.get("last_seen")))
+    total_n = len(all_users_stats)
+    st.markdown(
+        '<div class="admin-stats-row">'
+        f'<div class="admin-stat"><div class="admin-stat-label">👥 Profile hinterlegt</div>'
+        f'<div class="admin-stat-value">{total_n}</div></div>'
+        f'<div class="admin-stat"><div class="admin-stat-label">🟢 Gerade online</div>'
+        f'<div class="admin-stat-value online">{online_n}</div></div>'
+        f'<div class="admin-stat"><div class="admin-stat-label">⚪ Offline</div>'
+        f'<div class="admin-stat-value offline">{total_n - online_n}</div></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
     with st.container(border=True):
         all_users = db.get_all_users()
         pending_count = sum(1 for u in all_users if not u["is_approved"] and not u["is_banned"])
@@ -373,7 +409,7 @@ def render_admin_dashboard() -> None:
                             )
                     with c_name:
                         st.markdown(
-                            f'<div class="admin-name">{html_lib.escape(u["twitch_username"])}</div>'
+                            f'<div class="admin-name">{_online_dot_html(u)} {html_lib.escape(u["twitch_username"])}</div>'
                             f'<div style="margin-top:2px;">{_rang_badge_html(u)} {_status_badge_html(u)}</div>',
                             unsafe_allow_html=True,
                         )
