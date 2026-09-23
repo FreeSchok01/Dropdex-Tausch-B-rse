@@ -40,12 +40,27 @@ def init_db() -> None:
         conn.commit()
 
 
-def add_notification(user_id: int, message: str) -> None:
-    """Legt eine neue Nachricht für `user_id` an (z.B. wenn ein Tausch bestätigt wurde)."""
+def add_notification(user_id: int, message: str) -> int:
+    """Legt eine neue Nachricht für `user_id` an (z.B. wenn ein Tausch bestätigt wurde).
+    Gibt die ID der neu angelegten Nachricht zurück, damit sie z.B. per update_message()
+    später ergänzt werden kann (siehe trade_watch.py – Tauschpartner-Abgleich)."""
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO notifications (user_id, message, created_at, is_read) VALUES (?, ?, ?, 0)",
             (user_id, message, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_message(notification_id: int, message: str) -> None:
+    """Ersetzt den Text einer bestehenden Nachricht (z.B. wenn nachträglich der Tauschpartner
+    gefunden wurde, siehe trade_watch.py) und markiert sie wieder als ungelesen, damit die
+    Ergänzung dem Nutzer nicht einfach durchrutscht."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE notifications SET message = ?, is_read = 0 WHERE id = ?",
+            (message, notification_id),
         )
         conn.commit()
 
