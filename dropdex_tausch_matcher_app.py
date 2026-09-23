@@ -36,6 +36,7 @@ import requests
 import streamlit as st
 
 import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
+import chat  # eigenständiges Mini-Modul für den "💬 Chat"-Reiter (siehe chat.py)
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
 import trade_watch  # beobachtet das eigene Profil alle 10s auf verschwundene Karten (siehe trade_watch.py)
@@ -4590,6 +4591,106 @@ def render_admin_tab(name_map: Dict[str, str]) -> None:
     render_admin_panel(name_map)
 
 
+def render_chat_tab(user: Dict[str, Any]) -> None:
+    """Bereich „💬 Chat“: direkte 1:1-Nachrichten mit anderen registrierten Accounts.
+    Partner werden per Twitch-Username gesucht (unabhängig von Tausch-Matches) - ein
+    Chat funktioniert nur mit Accounts, die selbst eingeloggt sind/waren, nicht mit
+    beliebigen, nur über eine Dropdex-Profil-URL bekannten Personen.
+    Aktualisierung bewusst NUR manuell über den „🔄 Aktualisieren“-Button (kein
+    zusätzlicher Auto-Refresh-Timer neben render_auto_refresh())."""
+    st.markdown('<div class="section-title">💬 Chat</div>', unsafe_allow_html=True)
+
+    col_refresh, _ = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 Aktualisieren", key="chat_refresh", use_container_width=True):
+            st.rerun()
+
+    col_list, col_thread = st.columns([2, 3])
+
+    with col_list:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">🔎 Nutzer suchen</div>', unsafe_allow_html=True)
+        query = st.text_input("Twitch-Username", key="chat_search_query",
+                               placeholder="z. B. streamername", label_visibility="collapsed")
+        if query.strip():
+            results = db.search_users_by_username(query, exclude_user_id=user["id"])
+            if not results:
+                st.caption("Kein Nutzer mit diesem Namen gefunden.")
+            for r in results:
+                if st.button(f"💬 {r['twitch_username']}", key=f"chat_start_{r['id']}",
+                             use_container_width=True):
+                    st.session_state["chat_partner_id"] = r["id"]
+                    st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">💬 Unterhaltungen</div>', unsafe_allow_html=True)
+        convos = chat.get_conversations_overview(user["id"])
+        convos.sort(key=lambda c: c["last_at"], reverse=True)
+        if not convos:
+            st.caption("Noch keine Unterhaltungen. Suche oben nach einem Twitch-Namen, "
+                       "um einen Chat zu starten.")
+        for c in convos:
+            partner = db.get_user_by_id(c["partner_id"])
+            pname = partner["twitch_username"] if partner else "Unbekannter Nutzer"
+            label = f"👤 {pname}" + (f"  ({c['unread']})" if c["unread"] else "")
+            active = st.session_state.get("chat_partner_id") == c["partner_id"]
+            if st.button(label, key=f"chat_convo_{c['partner_id']}", use_container_width=True,
+                         type="primary" if active else "secondary"):
+                st.session_state["chat_partner_id"] = c["partner_id"]
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col_thread:
+        partner_id = st.session_state.get("chat_partner_id")
+        if not partner_id:
+            st.info("Wähle links eine Unterhaltung aus oder suche nach einem Twitch-Namen, "
+                    "um zu chatten.")
+            return
+
+        partner = db.get_user_by_id(partner_id)
+        if not partner:
+            st.error("Dieser Nutzer existiert nicht mehr.")
+            return
+
+        # Beim Öffnen der Unterhaltung gelten alle eingehenden Nachrichten als gelesen.
+        chat.mark_conversation_read(user["id"], partner_id)
+
+        st.markdown(f'<div class="panel-label">👤 {html_lib.escape(partner["twitch_username"])}</div>',
+                    unsafe_allow_html=True)
+
+        messages = chat.get_conversation(user["id"], partner_id)
+        thread_html = ['<div style="max-height:420px; overflow-y:auto; padding:4px 2px;">']
+        if not messages:
+            thread_html.append('<div class="panel-hint">Noch keine Nachrichten - schreib die erste!</div>')
+        for m in messages:
+            mine = m["from_user_id"] == user["id"]
+            ts = m["created_at"].replace("T", " ")
+            bubble_style = (
+                "background:linear-gradient(90deg,#7c3aed,#6366f1); color:#fff; margin-left:auto;"
+                if mine else
+                "background:#171826; border:1px solid #2a2c40; color:#e7e7ef; margin-right:auto;"
+            )
+            thread_html.append(
+                f'<div style="max-width:75%; {bubble_style} border-radius:14px; '
+                f'padding:8px 14px; margin:6px 0;">'
+                f'{html_lib.escape(m["body"])}'
+                f'<div style="font-size:0.65rem; opacity:0.65; margin-top:4px;">'
+                f'{html_lib.escape(ts)}</div></div>'
+            )
+        thread_html.append('</div>')
+        st.markdown(''.join(thread_html), unsafe_allow_html=True)
+
+        with st.form(key=f"chat_form_{partner_id}", clear_on_submit=True):
+            body = st.text_area("Nachricht", key=f"chat_input_{partner_id}",
+                                 placeholder="Nachricht schreiben …",
+                                 label_visibility="collapsed", height=80)
+            sent = st.form_submit_button("Senden", use_container_width=True)
+        if sent and body.strip():
+            chat.send_message(user["id"], partner_id, body)
+            st.rerun()
+
+
 def render_news_tab(user: Dict[str, Any]) -> None:
     """Bereich „🔔 News“: zeigt alle Tausch-Benachrichtigungen des eingeloggten Nutzers –
     eine Nachricht landet hier, sobald irgendwo ein Tausch per „✅ Als getauscht markieren“
@@ -4645,6 +4746,7 @@ SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
         ("search", "🔍", "Meine fehlende Karten"),
         ("getrid", "🎯", "Karte loswerden"),
         ("trade", "🔄", "1:1 Tausch"),
+        ("chat", "💬", "Chat"),
         ("news", "🔔", "News"),
     ]),
 ]
@@ -4653,6 +4755,7 @@ SIDEBAR_PAGE_LABELS: Dict[str, str] = {
     "search": "🔍 Meine fehlende Karten",
     "getrid": "🎯 Karte loswerden",
     "trade": "🔄 1:1 Tausch",
+    "chat": "💬 Chat",
     "news": "🔔 News",
     "admin": "🛠️ Admin",
 }
@@ -4668,13 +4771,15 @@ def render_sidebar_nav(user: Dict[str, Any]) -> str:
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = groups[0][1][0][0]
 
-    unread = notifications.unread_count(user["id"])
+    unread_news = notifications.unread_count(user["id"])
+    unread_chat = chat.unread_count(user["id"])
 
     for label, items in groups:
         st.markdown(f'<div class="side-nav-label">{label}</div>', unsafe_allow_html=True)
         for key, icon, text in items:
             active = st.session_state["current_page"] == key
-            btn_label = f"{icon}  {text}" + (f"  ({unread})" if key == "news" and unread else "")
+            badge_n = unread_news if key == "news" else (unread_chat if key == "chat" else 0)
+            btn_label = f"{icon}  {text}" + (f"  ({badge_n})" if badge_n else "")
             if st.button(
                 btn_label, key=f"nav_{key}", use_container_width=True,
                 type="primary" if active else "secondary",
@@ -4724,6 +4829,7 @@ def main() -> None:
 
     notifications.init_db()
     trade_watch.init_db()
+    chat.init_db()
     user = st.session_state["auth_user"]
 
     # ---- Alle 10s: Seite neu laden + im Hintergrund prüfen, ob eine Karte aus dem eigenen
@@ -4750,6 +4856,8 @@ def main() -> None:
         render_get_rid_tab(name_map, selected_rarities, user)
     elif page == "🔄 1:1 Tausch":
         render_trade_tab(name_map, selected_rarities, user)
+    elif page == "💬 Chat":
+        render_chat_tab(user)
     elif page == "🔔 News":
         render_news_tab(user)
     elif page == "🛠️ Admin":
