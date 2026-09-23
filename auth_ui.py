@@ -20,6 +20,7 @@ import html as html_lib
 import streamlit as st
 
 import db
+import maintenance
 import twitch_auth
 
 # ---------------------------------------------------------------------------
@@ -166,6 +167,16 @@ def render_login_gate() -> bool:
                 f'{badge_html}</div></div>',
                 unsafe_allow_html=True,
             )
+            if user["is_admin"]:
+                maint_now = maintenance.is_maintenance_mode()
+                maint_on = st.toggle(
+                    "🚧 Wartungsmodus", value=maint_now, key="maintenance_toggle",
+                    help="An: nur du (Admin) kommst noch rein, alle anderen sehen "
+                         "eine Wartungsseite.",
+                )
+                if maint_on != maint_now:
+                    maintenance.set_maintenance_mode(maint_on)
+                    st.rerun()
             if st.button("🚪  Ausloggen", key="btn_logout", use_container_width=True):
                 token = st.session_state.get("session_token")
                 if token:
@@ -193,6 +204,24 @@ def render_login_gate() -> bool:
             "⏳ Dein Account wartet noch auf Freigabe durch einen Admin oder Supporter. "
             "Schau gleich nochmal vorbei – sobald du freigegeben bist, hast du automatisch Zugriff."
         )
+        return False
+
+    # ---- Wartungsmodus: nur Admins kommen durch, alle anderen sehen nur diese
+    # Meldung statt der eigentlichen App (siehe maintenance.py + Toggle oben). ----
+    if maintenance.is_maintenance_mode() and not user["is_admin"]:
+        st.markdown("<div style='height: 12vh;'></div>", unsafe_allow_html=True)
+        col_l, col_mid, col_r = st.columns([1, 1.4, 1])
+        with col_mid:
+            st.markdown(
+                "<div style='text-align:center; font-size:2.4rem;'>🚧</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "<h3 style='text-align:center; margin-top:0;'>Seite ist gerade in Wartungsarbeit</h3>"
+                "<p style='text-align:center; color:#a2a4bd;'>"
+                "Wir basteln gerade an der Tauschbörse. Schau in Kürze wieder vorbei!</p>",
+                unsafe_allow_html=True,
+            )
         return False
 
     return True
