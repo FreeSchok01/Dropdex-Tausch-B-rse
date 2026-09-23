@@ -16,7 +16,7 @@ Partner wird daher immer über die Twitch-Username-Suche (db.search_users_by_use
 gefunden, unabhängig von Tausch-Match-Ergebnissen.
 
 Die Chat-Seite wird bewusst NICHT automatisch neu geladen (kein zusätzlicher
-Timer neben render_auto_refresh() in der Haupt-App) – stattdessen gibt es
+Timer neben dem 5s-Hintergrundcheck in der Haupt-App) – stattdessen gibt es
 einen manuellen "🔄 Aktualisieren"-Button in der UI.
 """
 
