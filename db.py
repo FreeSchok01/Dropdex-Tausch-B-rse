@@ -1,482 +1,452 @@
 # -*- coding: utf-8 -*-
 """
-auth_ui.py
-==========
-Verbindet db.py + twitch_auth.py zu fertigen Streamlit-Bausteinen:
+db.py
+=====
+Leichtgewichtige SQLite-Datenbank für die Nutzerverwaltung (Twitch-Login,
+Admin- und Bann-Status). Wird von auth_ui.py verwendet.
 
-  - render_login_gate()     -> in main() ganz oben aufrufen.
-                                Gibt True zurück, wenn der Nutzer eingeloggt
-                                UND nicht gesperrt ist. Bei False: einfach
-                                `return` in main(), der Rest der App läuft
-                                dann nicht.
-  - render_admin_dashboard() -> irgendwo in main() aufrufen (z.B. direkt nach
-                                dem Login-Gate). Rendert sich nur, wenn der
-                                eingeloggte Nutzer is_admin == True hat.
+Tabelle `users`:
+    id                  INTEGER PRIMARY KEY
+    twitch_id           TEXT UNIQUE      (eindeutige Twitch-User-ID)
+    twitch_username     TEXT             (aktueller Anzeigename)
+    profile_image_url   TEXT
+    is_admin            INTEGER (0/1)
+    is_supporter        INTEGER (0/1)    (Moderations-Rang unterhalb Admin, siehe Freigaben)
+    is_banned           INTEGER (0/1)
+    is_approved         INTEGER (0/1)    (muss von Admin/Supporter freigegeben werden)
+    last_login          TEXT (ISO-Zeitstempel, UTC)
+    own_profile_url     TEXT             (eigenes, privates Dropdex-Profil des Accounts)
+    own_profile_name    TEXT
+
+Tabelle `progress_snapshots` (Verlauf des Sammelfortschritts pro Nutzer):
+    id                  INTEGER PRIMARY KEY
+    user_id             INTEGER          (-> users.id)
+    taken_at            TEXT (ISO-Zeitstempel, UTC)
+    distinct_owned      INTEGER          (verschiedene besessene Karten)
+    distinct_total      INTEGER          (verschiedene Karten insgesamt im Profil)
+    total_copies        INTEGER          (Karten insgesamt inkl. Dubletten)
+    missing_count       INTEGER          (fehlende, verschiedene Karten)
+
+Tabelle `sessions` ("eingeloggt bleiben" über ?session=... in der URL):
+    token               TEXT PRIMARY KEY (zufälliges Token, landet in der URL)
+    twitch_id           TEXT             (-> users.twitch_id)
+    created_at          TEXT (ISO-Zeitstempel, UTC)
+    expires_at          TEXT (ISO-Zeitstempel, UTC; nach SESSION_TTL_DAYS abgelaufen)
+
+Tabelle `favorites` (Favoriten-Schnellauswahl je Account, siehe profile_picker()):
+    user_id             INTEGER          (-> users.id)
+    profile_url         TEXT             (Schlüssel wie in name_map/dropdex_namen.json)
+    profile_name        TEXT             (Anzeigename zum Zeitpunkt des Favorisierens)
+    created_at          TEXT (ISO-Zeitstempel, UTC)
+
+Zusätzliche Spalten in `users` (nachträglich per _ensure_column ergänzt):
+    last_seen              TEXT (ISO-Zeitstempel, UTC) - für den Online-Status in der Chat-Liste,
+                            wird bei jedem Seitenaufruf per touch_last_seen() aktualisiert.
+    show_on_leaderboard    INTEGER (0/1, Default 1) - Opt-out für die öffentliche Bestenliste
+                            (basiert auf progress_snapshots, siehe get_leaderboard()).
 """
 
-from typing import Any, Dict, Set
-import html as html_lib
+import secrets
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import streamlit as st
+# Liegt neben der App -> bei Neustart bleibt sie erhalten, solange der
+# Speicher des Hosters nicht flüchtig ist (siehe Hinweis im Admin-Panel
+# der Haupt-App zu dropdex_namen.json - gilt hier analog).
+DB_PATH = Path(__file__).with_name("dropdex_users.db")
 
-import db
-import twitch_auth
+# "Eingeloggt bleiben": so lange ist ein Session-Token nach dem Login gültig.
+SESSION_TTL_DAYS = 30
+
+
+@contextmanager
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Fügt eine Spalte nachträglich hinzu, falls sie in einer bestehenden DB noch fehlt
+    (SQLite kennt kein 'ADD COLUMN IF NOT EXISTS', daher der try/except-Umweg)."""
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def init_db() -> None:
+    """Legt die Tabellen an, falls sie noch nicht existieren, und ergänzt fehlende
+    Spalten in bereits bestehenden Datenbanken. Idempotent."""
+    with get_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                twitch_id          TEXT NOT NULL UNIQUE,
+                twitch_username    TEXT NOT NULL,
+                profile_image_url  TEXT DEFAULT '',
+                is_admin           INTEGER NOT NULL DEFAULT 0,
+                is_banned          INTEGER NOT NULL DEFAULT 0,
+                last_login         TEXT
+            )
+            """
+        )
+        _ensure_column(conn, "users", "own_profile_url", "TEXT DEFAULT ''")
+        _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
+        _ensure_column(conn, "users", "last_seen", "TEXT")
+        _ensure_column(conn, "users", "show_on_leaderboard", "INTEGER NOT NULL DEFAULT 1")
+
+        cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        newly_added_approved = "is_approved" not in cols_before
+        _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
+        if newly_added_approved:
+            # Bestandsnutzer, die es schon vor der Freigabepflicht gab, waren faktisch immer
+            # schon freigeschaltet -> nicht nachträglich aussperren, nur künftige Neuanmeldungen
+            # (INSERT in create_user) starten mit is_approved = 0.
+            conn.execute("UPDATE users SET is_approved = 1")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS progress_snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                taken_at        TEXT NOT NULL,
+                distinct_owned  INTEGER NOT NULL,
+                distinct_total  INTEGER NOT NULL,
+                total_copies    INTEGER NOT NULL,
+                missing_count   INTEGER NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                twitch_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                expires_at  TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id       INTEGER NOT NULL,
+                profile_url   TEXT NOT NULL,
+                profile_name  TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (user_id, profile_url)
+            )
+            """
+        )
+
+
+def get_user_by_twitch_id(twitch_id: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE twitch_id = ?", (twitch_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO users (twitch_id, twitch_username, profile_image_url, last_login) "
+            "VALUES (?, ?, ?, ?)",
+            (twitch_id, twitch_username, profile_image_url, now),
+        )
+    return get_user_by_twitch_id(twitch_id)
+
+
+def touch_last_login(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> None:
+    """Aktualisiert last_login + ggf. geänderten Namen/Avatar bei jedem Login."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET last_login = ?, twitch_username = ?, profile_image_url = ? "
+            "WHERE twitch_id = ?",
+            (now, twitch_username, profile_image_url, twitch_id),
+        )
+
+
+def get_or_create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
+    """Kernfunktion für den Login: legt den Nutzer bei Erstlogin an, sonst last_login updaten."""
+    existing = get_user_by_twitch_id(twitch_id)
+    if existing is None:
+        return create_user(twitch_id, twitch_username, profile_image_url)
+    touch_last_login(twitch_id, twitch_username, profile_image_url)
+    return get_user_by_twitch_id(twitch_id)
+
+
+def search_users_by_username(query: str, exclude_user_id: Optional[int] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """Sucht registrierte, nicht gesperrte Nutzer per (Teil-)Twitch-Username - für die
+    Chat-Suche ("💬 Chat" -> Nutzer per Namen finden, unabhängig von Tausch-Matches)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE twitch_username LIKE ? AND is_banned = 0 "
+            "ORDER BY twitch_username COLLATE NOCASE LIMIT ?",
+            (f"%{q}%", limit),
+        ).fetchall()
+    results = [dict(r) for r in rows]
+    if exclude_user_id is not None:
+        results = [r for r in results if r["id"] != exclude_user_id]
+    return results
+
+
+def get_all_users() -> List[Dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users ORDER BY last_login DESC NULLS LAST"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_banned(user_id: int, banned: bool) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET is_banned = ? WHERE id = ?", (1 if banned else 0, user_id))
+
+
+def set_admin(user_id: int, admin: bool) -> None:
+    with get_connection() as conn:
+        if admin:
+            # Wer Admin wird, ist damit automatisch auch freigegeben.
+            conn.execute("UPDATE users SET is_admin = 1, is_approved = 1 WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
+
+
+def set_supporter(user_id: int, supporter: bool) -> None:
+    with get_connection() as conn:
+        if supporter:
+            # Wer Supporter wird, ist damit automatisch auch freigegeben.
+            conn.execute("UPDATE users SET is_supporter = 1, is_approved = 1 WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET is_supporter = 0 WHERE id = ?", (user_id,))
+
+
+def set_approved(user_id: int, approved: bool) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET is_approved = ? WHERE id = ?", (1 if approved else 0, user_id))
+
+
+def touch_last_seen(user_id: int) -> None:
+    """Aktualisiert den 'zuletzt aktiv'-Zeitstempel - wird bei jedem Seitenaufruf (main())
+    aufgerufen, damit die Chat-Liste einen groben Online-Status anzeigen kann."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, user_id))
+
+
+def set_leaderboard_visible(user_id: int, visible: bool) -> None:
+    """Opt-in/-out für die öffentliche Bestenliste (Standard: sichtbar)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET show_on_leaderboard = ? WHERE id = ?",
+            (1 if visible else 0, user_id),
+        )
+
+
+def get_pending_users() -> List[Dict[str, Any]]:
+    """Nutzer, die sich eingeloggt haben, aber noch nicht von einem Admin/Supporter
+    freigegeben wurden (und nicht gesperrt sind) - für den „Freigaben“-Bereich."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY last_login DESC NULLS LAST"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
-# Twitch-IDs (nicht Usernamen!), die beim ersten Login automatisch
-# is_admin = True bekommen. So kommst du selbst initial ins Admin-Dashboard,
-# ohne direkt in der SQLite-Datei herumzueditieren.
-# Deine Twitch-ID findest du z.B. über https://streamscharts.com/tools/convert-username
+# Eigenes (privates) Profil je Account
 # ---------------------------------------------------------------------------
-BOOTSTRAP_ADMIN_TWITCH_IDS: Set[str] = {
-     "171478372",
-}
 
-
-def _handle_oauth_callback() -> None:
-    """Wird bei jedem Rerun aufgerufen; reagiert nur, wenn Twitch uns per
-    Redirect ?code=...&state=... zurückgeschickt hat."""
-    params = st.query_params
-    code = params.get("code")
-    state = params.get("state")
-    if not code:
-        return
-
-    if not twitch_auth.verify_state(state):
-        st.error("⚠️ Login fehlgeschlagen (ungültiger oder abgelaufener Login-Versuch). Bitte erneut versuchen.")
-        st.query_params.clear()
-        return
-
-    access_token = twitch_auth.exchange_code_for_token(code)
-    if not access_token:
-        st.error("⚠️ Login bei Twitch fehlgeschlagen (Token konnte nicht abgerufen werden).")
-        st.query_params.clear()
-        return
-
-    twitch_user = twitch_auth.get_twitch_user(access_token)
-    if not twitch_user:
-        st.error("⚠️ Twitch-Nutzerdaten konnten nicht abgerufen werden.")
-        st.query_params.clear()
-        return
-
-    user = db.get_or_create_user(**twitch_user)
-    if user["twitch_id"] in BOOTSTRAP_ADMIN_TWITCH_IDS and not user["is_admin"]:
-        db.set_admin(user["id"], True)  # setzt intern auch is_approved = True
-        user = db.get_user_by_twitch_id(user["twitch_id"])
-
-    st.session_state["auth_user"] = user
-
-    # "Eingeloggt bleiben": Session-Token erzeugen und in der URL mitführen, statt sie
-    # zu leeren. Bei einem Reload (F5) schickt der Browser genau diese URL erneut mit,
-    # wir erkennen das Token unten in _restore_session_from_url() und loggen automatisch
-    # wieder ein - ganz ohne erneuten Twitch-Redirect.
-    session_token = db.create_session(user["twitch_id"])
-    st.query_params.clear()
-    st.query_params["session"] = session_token
-    st.session_state["session_token"] = session_token
-    st.rerun()
-
-
-def _restore_session_from_url() -> None:
-    """Loggt automatisch ein, wenn die URL noch ein gültiges ?session=... Token trägt
-    (z.B. nach einem Reload/F5) und noch kein Nutzer im session_state steckt."""
-    if st.session_state.get("auth_user"):
-        return
-    token = st.query_params.get("session")
-    if not token:
-        return
-    user = db.get_user_by_session_token(token)
-    if user:
-        st.session_state["auth_user"] = user
-        st.session_state["session_token"] = token
-    else:
-        # Token abgelaufen/ungültig -> aus der URL entfernen
-        st.query_params.clear()
-
-
-def _render_center_login() -> None:
-    """Login-Button mittig im Hauptbereich (zusätzlich zur Sidebar).
-    Wichtig, falls die Sidebar auf dem Gerät/Browser des Nutzers zugeklappt
-    oder der Öffnen-Button gerade nicht sichtbar ist - dann kommt man trotzdem
-    ohne die Sidebar zum Login."""
-    login_url = twitch_auth.get_login_url()
-    st.markdown("<div style='height: 10vh;'></div>", unsafe_allow_html=True)
-    col_l, col_mid, col_r = st.columns([1, 1.4, 1])
-    with col_mid:
-        st.markdown(
-            "<div style='text-align:center; font-size:2.4rem;'>👋</div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            "<h3 style='text-align:center; margin-top:0;'>Anmeldung erforderlich</h3>"
-            "<p style='text-align:center; color:#a2a4bd;'>"
-            "Melde dich mit Twitch an, um die Tauschbörse zu nutzen.</p>",
-            unsafe_allow_html=True,
-        )
-        st.link_button(
-            "🟣 Mit Twitch anmelden",
-            login_url,
-            type="primary",
-            use_container_width=True,
+def set_own_profile(user_id: int, url: str, name: str) -> None:
+    """Speichert/aktualisiert das private Dropdex-Profil des eingeloggten Nutzers.
+    Leere Strings (url='') entfernen die Hinterlegung wieder."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE users SET own_profile_url = ?, own_profile_name = ? WHERE id = ?",
+            (url.strip(), name.strip(), user_id),
         )
 
 
-def render_login_gate() -> bool:
-    """Login-Button / Bann-Meldung in der Sidebar.
+# ---------------------------------------------------------------------------
+# Fortschrittsverlauf ("Gesamtfortschritt") je Account
+# ---------------------------------------------------------------------------
 
-    Rückgabewert:
-        True  -> Nutzer ist eingeloggt und NICHT gesperrt -> App darf rendern
-        False -> Nutzer ist ausgeloggt ODER gesperrt -> main() sollte returnen
-    """
-    db.init_db()
-    db.delete_expired_sessions()
-    _handle_oauth_callback()
-    _restore_session_from_url()
+def add_progress_snapshot(
+    user_id: int,
+    distinct_owned: int,
+    distinct_total: int,
+    total_copies: int,
+    missing_count: int,
+) -> None:
+    """Speichert einen neuen Fortschritts-Schnappschuss (z.B. bei jedem Laden des
+    eigenen Profils in der Kartensuche)."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO progress_snapshots "
+            "(user_id, taken_at, distinct_owned, distinct_total, total_copies, missing_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, now, distinct_owned, distinct_total, total_copies, missing_count),
+        )
 
-    user = st.session_state.get("auth_user")
 
-    # Status frisch aus der DB nachladen (ein Admin könnte ihn inzwischen
-    # geändert haben, z.B. gerade eben gesperrt).
-    if user:
-        fresh = db.get_user_by_twitch_id(user["twitch_id"])
-        if fresh:
-            user = fresh
-            st.session_state["auth_user"] = user
-        else:
-            user = None
-            st.session_state.pop("auth_user", None)
+def get_progress_history(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Liefert die letzten Fortschritts-Schnappschüsse eines Nutzers, älteste zuerst
+    (praktisch für Verlaufs-Charts)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
 
-    with st.sidebar:
-        st.markdown('<div class="side-nav-label">ACCOUNT</div>', unsafe_allow_html=True)
-        if user:
-            if user.get("profile_image_url"):
-                avatar_html = f'<img class="account-avatar" src="{html_lib.escape(user["profile_image_url"])}" alt="">'
-            else:
-                avatar_html = '<div class="account-avatar account-avatar--fallback">👤</div>'
-            if user["is_admin"]:
-                badge_html = '<div class="account-badge account-badge--admin">🛡️ Admin</div>'
-            elif user["is_supporter"]:
-                badge_html = '<div class="account-badge account-badge--supporter">🧡 Supporter</div>'
-            else:
-                badge_html = ""
-            st.markdown(
-                f'<div class="account-card">{avatar_html}'
-                f'<div class="account-meta">'
-                f'<div class="account-name">{html_lib.escape(user["twitch_username"])}</div>'
-                f'{badge_html}</div></div>',
-                unsafe_allow_html=True,
+
+def get_latest_progress(user_id: int) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_leaderboard(limit: int = 50) -> List[Dict[str, Any]]:
+    """Öffentliche Bestenliste: für jeden nicht gesperrten Nutzer mit
+    show_on_leaderboard = 1 der jeweils NEUESTE Fortschritts-Schnappschuss, sortiert nach
+    verschiedenen besessenen Karten (dann nach Karten insgesamt) absteigend. Nutzer ohne
+    einen einzigen Snapshot (Profil noch nie geladen) tauchen hier nicht auf."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.id AS user_id, u.twitch_username, u.profile_image_url,
+                   p.taken_at, p.distinct_owned, p.distinct_total, p.total_copies, p.missing_count
+            FROM users u
+            JOIN progress_snapshots p ON p.id = (
+                SELECT id FROM progress_snapshots
+                WHERE user_id = u.id
+                ORDER BY taken_at DESC
+                LIMIT 1
             )
-            if st.button("🚪  Ausloggen", key="btn_logout", use_container_width=True):
-                token = st.session_state.get("session_token")
-                if token:
-                    db.delete_session(token)
-                st.session_state.pop("auth_user", None)
-                st.session_state.pop("session_token", None)
-                st.query_params.clear()
-                st.rerun()
-        else:
-            login_url = twitch_auth.get_login_url()
-            st.link_button("🟣 Mit Twitch anmelden", login_url, type="primary", use_container_width=True)
-            st.caption("Login erforderlich, um die Tauschbörse zu nutzen.")
-        st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+            WHERE u.is_banned = 0 AND u.show_on_leaderboard = 1
+            ORDER BY p.distinct_owned DESC, p.total_copies DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
-    if not user:
-        _render_center_login()
-        return False
 
-    if user["is_banned"]:
-        st.error("🚫 Dein Account ist für dieses Tool gesperrt.")
-        return False
+# ---------------------------------------------------------------------------
+# Sessions ("eingeloggt bleiben" per Token in der URL, siehe auth_ui.py)
+# ---------------------------------------------------------------------------
 
-    if not user["is_approved"]:
-        st.warning(
-            "⏳ Dein Account wartet noch auf Freigabe durch einen Admin oder Supporter. "
-            "Schau gleich nochmal vorbei – sobald du freigegeben bist, hast du automatisch Zugriff."
+def create_session(twitch_id: str) -> str:
+    """Erzeugt ein neues, zufälliges Session-Token für diesen Nutzer und speichert es
+    mit Ablaufzeit (SESSION_TTL_DAYS). Gibt das Token zurück, das in die URL kommt."""
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=SESSION_TTL_DAYS)
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (token, twitch_id, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
         )
-        return False
-
-    return True
+    return token
 
 
-ADMIN_CSS = """
-<style>
-.admin-shell { display:flex; gap:0; border-radius:18px; overflow:hidden;
-    border:1px solid #2a2c45; margin: 6px 0 26px 0; background:#0d0e18; }
-.admin-nav {
-    background: linear-gradient(180deg, #1c1030 0%, #120c1f 100%);
-    padding: 18px 12px; min-width: 190px; border-right: 1px solid #2a2c45;
-}
-.admin-nav-title { font-weight:800; color:#eceef8; font-size:0.95rem;
-    padding: 4px 6px 14px 6px; }
-.admin-col { padding: 20px 22px; }
-.admin-col-right { border-left: 1px solid #2a2c45; min-width: 260px; max-width: 300px; }
-.admin-header-row { display:flex; align-items:center; justify-content:space-between;
-    margin-bottom: 14px; }
-.admin-header-row h3 { margin:0; font-size:1.15rem; color:#eceef8; }
-.admin-count { color:#8b8d9e; font-size:0.82rem; margin-left:8px; }
-.admin-row {
-    display:flex; align-items:center; gap:12px; padding:9px 10px; border-radius:10px;
-    border:1px solid transparent;
-}
-.admin-row:hover { background: rgba(255,255,255,0.03); border-color:#2a2c45; }
-.admin-avatar { width:34px; height:34px; border-radius:50%; object-fit:cover;
-    border:1px solid #2a2c45; flex-shrink:0; background:#1c1d2c; }
-.admin-name { font-weight:700; color:#e7e7ef; font-size:0.92rem; }
-.admin-sub { color:#7d7f97; font-size:0.72rem; }
-.admin-badge {
-    display:inline-block; padding:2px 9px; border-radius:6px; font-size:0.68rem;
-    font-weight:800; white-space:nowrap; text-transform:uppercase; letter-spacing:0.02em;
-}
-.admin-badge-admin { background: rgba(245,158,11,0.18); color:#f59e0b; border:1px solid #f59e0b; }
-.admin-badge-supporter { background: rgba(192,38,211,0.18); color:#d94ded; border:1px solid #c026d3; }
-.admin-badge-viewer { background: rgba(156,163,175,0.18); color:#b7bac4; border:1px solid #9ca3af; }
-.admin-badge-approved { background: rgba(34,197,94,0.18); color:#34d399; border:1px solid #22c55e; }
-.admin-badge-pending { background: rgba(59,130,246,0.18); color:#5b9bff; border:1px solid #3b82f6; }
-.admin-badge-banned { background: rgba(239,68,68,0.18); color:#f87171; border:1px solid #ef4444; }
-.admin-detail-card { text-align:center; padding: 6px 4px 18px 4px; }
-.admin-detail-card img { width:64px; height:64px; border-radius:50%; object-fit:cover;
-    border:2px solid #2a2c45; margin-bottom:8px; }
-.admin-detail-name { font-weight:800; font-size:1.05rem; color:#eceef8; }
-.admin-info-label { color:#7d7f97; font-size:0.72rem; text-transform:uppercase;
-    letter-spacing:0.04em; margin-top:12px; }
-.admin-info-value { color:#e2e3f2; font-size:0.9rem; font-weight:600; margin-top:2px; }
-.admin-empty { color:#7d7f97; font-size:0.85rem; padding: 20px 6px; text-align:center; }
-</style>
-"""
+def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
+    """Liefert den Nutzer zu einem Session-Token, sofern es existiert und noch nicht
+    abgelaufen ist - sonst None."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT twitch_id FROM sessions WHERE token = ? AND expires_at > ?",
+            (token, now),
+        ).fetchone()
+        if not row:
+            return None
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE twitch_id = ?", (row["twitch_id"],)
+        ).fetchone()
+        return dict(user_row) if user_row else None
 
 
-def _rank(u: Dict[str, Any]) -> int:
-    """Rang-Stufe für den Vergleich: Admin > Supporter > Zuschauer."""
-    if u.get("is_admin"):
-        return 3
-    if u.get("is_supporter"):
-        return 2
-    return 1
+def delete_session(token: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
 
 
-def _can_ban(actor: Dict[str, Any], target: Dict[str, Any]) -> bool:
-    """Admins dürfen jeden sperren/entsperren (außer sich selbst). Supporter dürfen das nur bei
-    Nutzern, die im Rang UNTER ihnen stehen – also weder Admin noch Supporter sind."""
-    if actor.get("id") == target.get("id"):
-        return False
-    if actor.get("is_admin"):
-        return True
-    return _rank(target) < _rank(actor)
+def delete_expired_sessions() -> None:
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
 
 
-def _rang_badge_html(u: Dict[str, Any]) -> str:
-    if u.get("is_admin"):
-        return '<span class="admin-badge admin-badge-admin">🛡️ Admin</span>'
-    if u.get("is_supporter"):
-        return '<span class="admin-badge admin-badge-supporter">🧡 Supporter</span>'
-    return '<span class="admin-badge admin-badge-viewer">Zuschauer</span>'
+# ---------------------------------------------------------------------------
+# Favoriten (Schnellauswahl je Account, siehe profile_picker() in der App)
+# ---------------------------------------------------------------------------
+
+def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
+    """Merkt sich `profile_url` als Favorit für `user_id`. Erneutes Favorisieren
+    aktualisiert nur den gespeicherten Namen (z.B. falls er sich geändert hat)."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO favorites (user_id, profile_url, profile_name, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
+            (user_id, profile_url.strip(), profile_name.strip(), now),
+        )
 
 
-def _status_badge_html(u: Dict[str, Any]) -> str:
-    if u.get("is_banned"):
-        return '<span class="admin-badge admin-badge-banned">🚫 Gesperrt</span>'
-    if not u.get("is_approved"):
-        return '<span class="admin-badge admin-badge-pending">⏳ Wartet</span>'
-    return '<span class="admin-badge admin-badge-approved">✅ Freigegeben</span>'
+def remove_favorite(user_id: int, profile_url: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?",
+            (user_id, profile_url.strip()),
+        )
 
 
-def render_admin_dashboard() -> None:
-    """Moderations-Dashboard im Stil „Nutzerübersicht / Freigaben / Gesperrt“ mit
-    Detail-Panel rechts. Freigeben+Bannen für Admin + Supporter, volle Rechteverwaltung
-    (Admin-/Supporter-Vergabe) nur für Admins. Rendert sich nur, wenn der eingeloggte
-    Nutzer is_admin ODER is_supporter hat."""
-    user = st.session_state.get("auth_user")
-    if not user or not (user.get("is_admin") or user.get("is_supporter")):
-        return
+def is_favorite(user_id: int, profile_url: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?",
+            (user_id, profile_url.strip()),
+        ).fetchone()
+        return row is not None
 
-    is_full_admin = bool(user.get("is_admin"))
-    st.markdown(ADMIN_CSS, unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title">🛠️ Moderations-Dashboard</div>', unsafe_allow_html=True)
-    with st.container(border=True):
-        all_users = db.get_all_users()
-        pending_count = sum(1 for u in all_users if not u["is_approved"] and not u["is_banned"])
-        banned_count = sum(1 for u in all_users if u["is_banned"])
-
-        # ---- Navigation: Admins UND Supporter sehen alle 3 Bereiche (inkl. voller
-        # Nutzerübersicht) – wer davon wen sperren/entsperren darf, regelt _can_ban() unten. ----
-        sections = [
-            ("overview", "👥 Nutzerübersicht"), ("pending", f"🟢 Freigaben ({pending_count})"),
-            ("banned", f"🚫 Gesperrt ({banned_count})"),
-        ]
-        active = st.session_state.get("admin_nav_section", sections[0][0])
-        if active not in dict(sections):
-            active = sections[0][0]
-
-        nav_col, list_col, detail_col = st.columns([1, 2.6, 1.3])
-
-        with nav_col:
-            st.markdown('<div class="admin-nav-title">Bereich</div>', unsafe_allow_html=True)
-            for key, label in sections:
-                if st.button(
-                    label, key=f"admin_nav_{key}", use_container_width=True,
-                    type="primary" if key == active else "secondary",
-                ):
-                    st.session_state["admin_nav_section"] = key
-                    st.session_state.pop("admin_page", None)
-                    st.rerun()
-
-        # ---- Liste je nach aktivem Bereich filtern ----
-        if active == "pending":
-            filtered = [u for u in all_users if not u["is_approved"] and not u["is_banned"]]
-            title = "Freigaben"
-        elif active == "banned":
-            filtered = [u for u in all_users if u["is_banned"]]
-            title = "Gesperrte User"
-        else:
-            filtered = all_users
-            title = "Aktuelle User"
-
-        with list_col:
-            st.markdown(
-                f'<div class="admin-header-row"><h3>{title}</h3>'
-                f'<span class="admin-count">{len(filtered)} gesamt</span></div>',
-                unsafe_allow_html=True,
-            )
-            search = st.text_input(
-                "User suchen", key="admin_search", placeholder="🔍 User suchen …",
-                label_visibility="collapsed",
-            )
-            if search.strip():
-                needle = search.strip().lower()
-                filtered = [u for u in filtered if needle in u["twitch_username"].lower()]
-
-            if not filtered:
-                st.markdown('<div class="admin-empty">Keine User in diesem Bereich.</div>', unsafe_allow_html=True)
-            else:
-                page_size = 10
-                total_pages = max(1, (len(filtered) + page_size - 1) // page_size)
-                page = min(st.session_state.get("admin_page", 1), total_pages)
-                start = (page - 1) * page_size
-                page_users = filtered[start:start + page_size]
-
-                selected_id = st.session_state.get("admin_selected_user_id")
-                if page_users and selected_id not in {u["id"] for u in page_users} and selected_id not in {u["id"] for u in all_users}:
-                    st.session_state["admin_selected_user_id"] = page_users[0]["id"]
-                    selected_id = page_users[0]["id"]
-                elif selected_id is None and page_users:
-                    st.session_state["admin_selected_user_id"] = page_users[0]["id"]
-                    selected_id = page_users[0]["id"]
-
-                for u in page_users:
-                    c_img, c_name, c_view, c_ok, c_ban = st.columns([0.6, 2.6, 0.7, 0.7, 0.7])
-                    with c_img:
-                        if u.get("profile_image_url"):
-                            st.markdown(
-                                f'<img class="admin-avatar" src="{html_lib.escape(u["profile_image_url"])}" />',
-                                unsafe_allow_html=True,
-                            )
-                    with c_name:
-                        st.markdown(
-                            f'<div class="admin-name">{html_lib.escape(u["twitch_username"])}</div>'
-                            f'<div style="margin-top:2px;">{_rang_badge_html(u)} {_status_badge_html(u)}</div>',
-                            unsafe_allow_html=True,
-                        )
-                    with c_view:
-                        if st.button("👁️", key=f"admin_view_{u['id']}", help="Details anzeigen"):
-                            st.session_state["admin_selected_user_id"] = u["id"]
-                            st.rerun()
-                    with c_ok:
-                        # Freigeben (unbanned + nicht freigegeben) darf jeder Moderator; Entbannen
-                        # (is_banned) nur, wenn der Rang des Ziels unter dem eigenen liegt.
-                        show_ok = (not u["is_approved"] and not u["is_banned"]) or \
-                            (u["is_banned"] and _can_ban(user, u))
-                        if show_ok:
-                            if st.button("✅", key=f"admin_approve_{u['id']}", help="Freigeben / entbannen"):
-                                db.set_approved(u["id"], True)
-                                db.set_banned(u["id"], False)
-                                st.rerun()
-                    with c_ban:
-                        if not u["is_banned"] and _can_ban(user, u):
-                            if st.button("🚫", key=f"admin_ban_{u['id']}", help="Bannen"):
-                                db.set_banned(u["id"], True)
-                                st.rerun()
-
-                if total_pages > 1:
-                    p_prev, p_info, p_next = st.columns([1, 3, 1])
-                    with p_prev:
-                        if st.button("‹", key="admin_page_prev", disabled=page <= 1, use_container_width=True):
-                            st.session_state["admin_page"] = page - 1
-                            st.rerun()
-                    with p_info:
-                        st.markdown(
-                            f'<div style="text-align:center; color:#8b8d9e; font-size:0.82rem; padding-top:6px;">'
-                            f'Zeige {start + 1}–{min(start + page_size, len(filtered))} von {len(filtered)}'
-                            f"</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with p_next:
-                        if st.button("›", key="admin_page_next", disabled=page >= total_pages, use_container_width=True):
-                            st.session_state["admin_page"] = page + 1
-                            st.rerun()
-
-        # ---- Detail-Panel rechts für den ausgewählten User ----
-        with detail_col:
-            selected_id = st.session_state.get("admin_selected_user_id")
-            selected = next((u for u in all_users if u["id"] == selected_id), None)
-            if not selected:
-                st.markdown('<div class="admin-empty">Wähle links einen User aus.</div>', unsafe_allow_html=True)
-            else:
-                avatar = selected.get("profile_image_url") or ""
-                st.markdown(
-                    '<div class="admin-detail-card">'
-                    + (f'<img src="{html_lib.escape(avatar)}" />' if avatar else "")
-                    + f'<div class="admin-detail-name">{html_lib.escape(selected["twitch_username"])}</div>'
-                    + f'<div style="margin-top:6px;">{_status_badge_html(selected)}</div>'
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown('<div class="admin-info-label">Rang</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="admin-info-value">{_rang_badge_html(selected)}</div>', unsafe_allow_html=True)
-                st.markdown('<div class="admin-info-label">Letzter Login</div>', unsafe_allow_html=True)
-                st.markdown(
-                    f'<div class="admin-info-value">{html_lib.escape(selected.get("last_login") or "–")}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown('<div class="admin-info-label">Twitch-ID</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="admin-info-value">{html_lib.escape(selected["twitch_id"])}</div>', unsafe_allow_html=True)
-
-                st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
-
-                if selected["is_banned"]:
-                    if _can_ban(user, selected):
-                        if st.button("✅ Entbannen", key="admin_detail_unban", use_container_width=True, type="primary"):
-                            db.set_banned(selected["id"], False)
-                            st.rerun()
-                    else:
-                        st.caption("Dieser Nutzer steht in deinem Rang oder darüber – du kannst ihn nicht entbannen.")
-                else:
-                    if not selected["is_approved"]:
-                        if st.button("✅ Freigeben", key="admin_detail_approve", use_container_width=True, type="primary"):
-                            db.set_approved(selected["id"], True)
-                            st.rerun()
-                    if _can_ban(user, selected):
-                        if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
-                            db.set_banned(selected["id"], True)
-                            st.rerun()
-                    elif selected["id"] != user["id"]:
-                        st.caption("Dieser Nutzer steht in deinem Rang oder darüber – du kannst ihn nicht bannen.")
-
-                if is_full_admin and selected["id"] != user["id"]:
-                    st.markdown("<div style='margin-top:10px;'></div>", unsafe_allow_html=True)
-                    if selected.get("is_admin"):
-                        if st.button("🛡️ Admin entziehen", key="admin_detail_unadmin", use_container_width=True):
-                            db.set_admin(selected["id"], False)
-                            st.rerun()
-                    else:
-                        if st.button("🛡️ Zum Admin machen", key="admin_detail_admin", use_container_width=True):
-                            db.set_admin(selected["id"], True)
-                            st.rerun()
-                    if selected.get("is_supporter"):
-                        if st.button("🧡 Supporter entziehen", key="admin_detail_unsupp", use_container_width=True):
-                            db.set_supporter(selected["id"], False)
-                            st.rerun()
-                    else:
-                        if st.button("🧡 Zum Supporter machen", key="admin_detail_supp", use_container_width=True):
-                            db.set_supporter(selected["id"], True)
-                            st.rerun()
+def get_favorites(user_id: int) -> List[Dict[str, Any]]:
+    """Alle Favoriten von `user_id`, alphabetisch nach Name - für die Favoriten-
+    Schnellauswahl in profile_picker()."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
