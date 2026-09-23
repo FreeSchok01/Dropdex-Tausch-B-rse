@@ -113,6 +113,11 @@ def init_db() -> None:
             # (INSERT in create_user) starten mit is_approved = 0.
             conn.execute("UPDATE users SET is_approved = 1")
 
+        # Normale User brauchen keine Bestätigung mehr: alle noch wartenden, nicht gesperrten
+        # Accounts werden bei jedem Start automatisch freigegeben. Läuft bei jedem init_db()-
+        # Aufruf, ist aber günstig und idempotent (betrifft nur is_approved = 0-Zeilen).
+        conn.execute("UPDATE users SET is_approved = 1 WHERE is_approved = 0 AND is_banned = 0")
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS progress_snapshots (
@@ -167,11 +172,14 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
+    """Legt einen neuen Nutzer an. Normale User brauchen keine Bestätigung mehr durch
+    Admin/Supporter - is_approved wird daher direkt auf 1 gesetzt (Freigabe-Pflicht ist
+    nur noch als Feld vorhanden, falls sie später mal wieder gebraucht wird)."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO users (twitch_id, twitch_username, profile_image_url, last_login) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO users (twitch_id, twitch_username, profile_image_url, last_login, is_approved) "
+            "VALUES (?, ?, ?, ?, 1)",
             (twitch_id, twitch_username, profile_image_url, now),
         )
     return get_user_by_twitch_id(twitch_id)
