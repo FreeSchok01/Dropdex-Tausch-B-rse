@@ -253,10 +253,31 @@ def set_approved(user_id: int, approved: bool) -> None:
 
 def touch_last_seen(user_id: int) -> None:
     """Aktualisiert den 'zuletzt aktiv'-Zeitstempel - wird bei jedem Seitenaufruf (main())
-    aufgerufen, damit die Chat-Liste einen groben Online-Status anzeigen kann."""
+    aufgerufen, damit die Chat-Liste und das Admin-Dashboard einen groben Online-Status
+    anzeigen können."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, user_id))
+
+
+# Innerhalb dieser Zeitspanne seit dem letzten Seitenaufruf/Fragment-Tick gilt ein Account
+# als "online" - einzige Quelle der Wahrheit, genutzt von der Chat-Liste UND vom
+# Moderations-Dashboard (siehe auth_ui.render_admin_dashboard()).
+ONLINE_THRESHOLD_SECONDS = 5 * 60
+
+
+def is_user_online(last_seen: Optional[str]) -> bool:
+    """True, wenn `last_seen` (ISO-Zeitstempel aus touch_last_seen()) innerhalb von
+    ONLINE_THRESHOLD_SECONDS liegt."""
+    if not last_seen:
+        return False
+    try:
+        seen_at = datetime.fromisoformat(last_seen)
+    except ValueError:
+        return False
+    now = datetime.now(timezone.utc) if seen_at.tzinfo else datetime.utcnow()
+    delta_s = (now - seen_at).total_seconds()
+    return 0 <= delta_s <= ONLINE_THRESHOLD_SECONDS
 
 
 def set_leaderboard_visible(user_id: int, visible: bool) -> None:
