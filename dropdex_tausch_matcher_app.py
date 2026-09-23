@@ -4299,6 +4299,15 @@ def _admin_add_profiles() -> None:
 
 
 def _admin_delete_profiles() -> None:
+    """Löscht Profile - nur echte Admins dürfen das (Supporter dürfen zwar Profile
+    hinzufügen, siehe render_admin_panel(), aber nicht löschen). Der Check hier ist ein
+    zusätzliches Sicherheitsnetz zur UI (der 🗑️-Button wird Supportern gar nicht erst
+    angezeigt), falls der Callback doch mal ohne den Button ausgelöst werden sollte."""
+    current = st.session_state.get("auth_user") or {}
+    if not current.get("is_admin"):
+        st.session_state["admin_msg"] = {"errors": ["Nur Admins dürfen Profile löschen."], "saved": True}
+        st.session_state["admin_delete"] = []
+        return
     nm = load_name_map()
     for url in st.session_state.get("admin_delete", []):
         nm.pop(url, None)
@@ -4354,10 +4363,14 @@ def _admin_append_scan() -> None:
     st.session_state["admin_bulk"] = (cur + "\n" if cur else "") + "\n".join(lines)
 
 
-def render_admin_panel(name_map: Dict[str, str]) -> None:
-    """Admin-Bereich (passwortgeschützt): viele Profile (Name + URL) auf einmal hinzufügen, löschen,
-    sichern. Alles landet dauerhaft in dropdex_namen.json und steht danach überall als Auswahl/Partner bereit."""
-    with st.expander("🔐 Admin · Profile verwalten", expanded=False):
+def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
+    """Bereich (passwortgeschützt): viele Profile (Name + URL) auf einmal hinzufügen, sichern.
+    Alles landet dauerhaft in dropdex_namen.json und steht danach überall als Auswahl/Partner
+    bereit. Löschen (🗑️) ist hier bewusst nur für echte Admins sichtbar - Supporter dürfen
+    Profile hinzufügen/aktualisieren, aber keine löschen (siehe _admin_delete_profiles())."""
+    can_delete = bool(user.get("is_admin"))
+    panel_title = "🔐 Admin · Profile verwalten" if can_delete else "🧡 Supporter · Profile hinzufügen"
+    with st.expander(panel_title, expanded=False):
         st.markdown(auth_ui.ADMIN_CSS, unsafe_allow_html=True)
 
         pw = get_admin_password()
@@ -4469,7 +4482,10 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
                     page_rows = rows[start:start + page_size]
 
                     for url, nm in page_rows:
-                        c_name, c_del = st.columns([5, 0.8])
+                        if can_delete:
+                            c_name, c_del = st.columns([5, 0.8])
+                        else:
+                            c_name = st.container()
                         with c_name:
                             st.markdown(
                                 f'<div class="admin-row"><div>'
@@ -4478,11 +4494,12 @@ def render_admin_panel(name_map: Dict[str, str]) -> None:
                                 f'</div></div>',
                                 unsafe_allow_html=True,
                             )
-                        with c_del:
-                            if st.button("🗑️", key=f"admin_del_{url}", help="Profil löschen"):
-                                st.session_state["admin_delete"] = [url]
-                                _admin_delete_profiles()
-                                st.rerun()
+                        if can_delete:
+                            with c_del:
+                                if st.button("🗑️", key=f"admin_del_{url}", help="Profil löschen"):
+                                    st.session_state["admin_delete"] = [url]
+                                    _admin_delete_profiles()
+                                    st.rerun()
 
                     if total_pages > 1:
                         p_prev, p_info, p_next = st.columns([1, 3, 1])
@@ -4640,11 +4657,22 @@ def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], use
     )
 
 
-def render_admin_tab(name_map: Dict[str, str]) -> None:
-    """Bereich „🛠️ Admin“: Nutzerverwaltung (Sperren/Admin) + öffentliche Profilliste verwalten.
-    Wird in main() nur als Reiter angeboten, wenn der eingeloggte Nutzer Admin ist."""
+def render_admin_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
+    """Bereich „🛠️ Admin“: Nutzerverwaltung (Sperren/Admin) + öffentliche Profilliste verwalten
+    (inkl. Löschen). Wird in main() nur als Reiter angeboten, wenn der eingeloggte Nutzer
+    Admin ist (siehe render_sidebar_nav())."""
     auth_ui.render_admin_dashboard()
-    render_admin_panel(name_map)
+    render_admin_panel(name_map, user)
+
+
+def render_supporter_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
+    """Bereich „🧡 Supporter“: eigener, von „🛠️ Admin“ getrennter Reiter für Supporter.
+    auth_ui.render_admin_dashboard() regelt intern bereits, welche Aktionen (Freigeben/Bannen)
+    ein Supporter im Vergleich zu einem Admin darf (siehe _can_ban() in auth_ui.py). Im
+    Profil-Bereich dürfen Supporter Profile hinzufügen, aber nicht löschen - siehe
+    render_admin_panel()."""
+    auth_ui.render_admin_dashboard()
+    render_admin_panel(name_map, user)
 
 
 def render_wishlist_tab(user: Dict[str, Any]) -> None:
@@ -5007,15 +5035,23 @@ SIDEBAR_PAGE_LABELS: Dict[str, str] = {
     "chat": "💬 Chat",
     "news": "🔔 News",
     "admin": "🛠️ Admin",
+    "supporter": "🧡 Supporter",
 }
 
 
 def render_sidebar_nav(user: Dict[str, Any]) -> str:
     """Baut die linke Navigation als Gruppenlabel + Icon-Pills (aktiver Eintrag = Lila-Verlauf).
-    Gibt das Label der aktuell gewählten Seite zurück (kompatibel zum bisherigen `page`-String)."""
+    Gibt das Label der aktuell gewählten Seite zurück (kompatibel zum bisherigen `page`-String).
+
+    Admin und Supporter bekommen bewusst getrennte Reiter (statt einem gemeinsamen "Admin"-
+    Reiter): Admins sehen "🛠️ Admin" (voller Zugriff inkl. Profile löschen), Supporter sehen
+    "🧡 Supporter" (u.a. Profile hinzufügen, aber nicht löschen - siehe render_admin_panel()).
+    Normale User (weder Admin noch Supporter) sehen keinen der beiden Reiter."""
     groups = list(SIDEBAR_NAV_GROUPS)
-    if user.get("is_admin") or user.get("is_supporter"):
+    if user.get("is_admin"):
         groups.append(("ADMIN", [("admin", "🛠️", "Admin")]))
+    elif user.get("is_supporter"):
+        groups.append(("SUPPORTER", [("supporter", "🧡", "Supporter")]))
 
     if "current_page" not in st.session_state:
         st.session_state["current_page"] = groups[0][1][0][0]
@@ -5130,7 +5166,9 @@ def main() -> None:
     elif page == "🔔 News":
         render_news_tab(user)
     elif page == "🛠️ Admin":
-        render_admin_tab(name_map)
+        render_admin_tab(name_map, user)
+    elif page == "🧡 Supporter":
+        render_supporter_tab(name_map, user)
 
 
 if __name__ == "__main__":
