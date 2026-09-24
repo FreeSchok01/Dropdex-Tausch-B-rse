@@ -162,3 +162,46 @@ def get_matches_for_offerer(user_id: int) -> List[Dict[str, Any]]:
         return []
     wish_board = wishlist.get_board(exclude_user_id=user_id)
     return [w for w in wish_board if w["card_id"] in offered_ids]
+
+
+def get_perfect_matches(user_id: int) -> List[Dict[str, Any]]:
+    """Echte 1:1-Tausch-Matches: andere Nutzer, die GLEICHZEITIG etwas anbieten, das ich
+    suche, UND etwas suchen, das ich anbiete - ein Tausch ganz ohne Umweg über Dritte.
+    Gibt pro passendem Partner eine Zeile zurück:
+        partner_id  - der andere Nutzer
+        from_them   - seine Angebots-Zeilen, die zu meinen Wünschen passen (was er mir geben könnte)
+        from_me     - seine Wunsch-Zeilen, die zu meinen Angeboten passen (was ich ihm geben könnte)
+    """
+    import wishlist
+    my_wants = {w["card_id"] for w in wishlist.get_my_wishes(user_id)}
+    my_offers_ids = {o["card_id"] for o in get_my_offers(user_id)}
+    if not my_wants or not my_offers_ids:
+        return []
+
+    other_offers = get_board(exclude_user_id=user_id)            # was andere anbieten
+    other_wishes = wishlist.get_board(exclude_user_id=user_id)   # was andere suchen
+
+    # Wer bietet mir etwas an, das ich suche? -> gruppiert nach Anbieter
+    offers_for_me: Dict[int, List[Dict[str, Any]]] = {}
+    for o in other_offers:
+        if o["card_id"] in my_wants:
+            offers_for_me.setdefault(o["user_id"], []).append(o)
+
+    # Wer sucht etwas, das ich anbiete? -> gruppiert nach Sucher
+    wishes_matching_me: Dict[int, List[Dict[str, Any]]] = {}
+    for w in other_wishes:
+        if w["card_id"] in my_offers_ids:
+            wishes_matching_me.setdefault(w["user_id"], []).append(w)
+
+    # Nur Partner, bei denen BEIDE Richtungen gleichzeitig zutreffen, ergeben einen
+    # perfekten Tausch (statt nur eines einseitigen Wunsches/Angebots).
+    matches: List[Dict[str, Any]] = []
+    for partner_id, their_offers in offers_for_me.items():
+        their_wishes = wishes_matching_me.get(partner_id)
+        if their_wishes:
+            matches.append({
+                "partner_id": partner_id,
+                "from_them": their_offers,
+                "from_me": their_wishes,
+            })
+    return matches
