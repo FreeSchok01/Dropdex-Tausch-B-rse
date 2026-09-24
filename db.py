@@ -53,6 +53,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import notifications  # für die Admin/Supporter-Benachrichtigung bei neuer Registrierung (siehe create_user())
+
 # Liegt neben der App -> bei Neustart bleibt sie erhalten, solange der
 # Speicher des Hosters nicht flüchtig ist (siehe Hinweis im Admin-Panel
 # der Haupt-App zu dropdex_namen.json - gilt hier analog).
@@ -166,6 +168,23 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
+def _notify_moderators_of_pending_signup(twitch_username: str) -> None:
+    """Benachrichtigt alle Admins/Supporter über einen neuen, wartenden Account (siehe
+    create_user()) - sonst würde eine Registrierung sonst niemand bemerken, außer man schaut
+    zufällig ins "Freigaben"-Tab des Admin-Dashboards. Eigenes try/except, damit ein Problem
+    hier NIE den Login selbst verhindern kann."""
+    try:
+        notifications.init_db()
+        with get_connection() as conn:
+            mods = conn.execute(
+                "SELECT id FROM users WHERE is_admin = 1 OR is_supporter = 1"
+            ).fetchall()
+        for m in mods:
+            notifications.add_notification(m["id"], f"🆕 {twitch_username} wartet auf Freigabe.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
     """Legt einen neuen Nutzer an. Muss erst von einem Admin/Supporter im "Freigaben"-Tab
     freigeschaltet werden (is_approved = 0), bevor render_login_gate() ihn in die App lässt."""
@@ -176,6 +195,7 @@ def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "
             "VALUES (?, ?, ?, ?, 0)",
             (twitch_id, twitch_username, profile_image_url, now),
         )
+    _notify_moderators_of_pending_signup(twitch_username)
     return get_user_by_twitch_id(twitch_id)
 
 
