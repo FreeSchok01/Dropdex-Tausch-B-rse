@@ -4799,11 +4799,45 @@ def render_supporter_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None
     render_admin_panel(name_map, user, require_password=False, as_expander=False)
 
 
+def _render_perfect_matches(user: Dict[str, Any]) -> None:
+    """Ganz oben in "📋 Ich suche" UND "🎁 Ich biete": Hinweis, wenn ein ECHTER 1:1-Tausch
+    möglich ist - ein anderer Nutzer bietet gleichzeitig etwas an, das ich suche, UND sucht
+    etwas, das ich anbiete (siehe offers.get_perfect_matches()). Stärker als die normalen,
+    einseitigen Match-Hinweise (_render_match_row()), daher optisch abgehoben (gold)."""
+    matches = offers.get_perfect_matches(user["id"])
+    if not matches:
+        return
+    for m in matches:
+        partner = db.get_user_by_id(m["partner_id"])
+        pname = partner["twitch_username"] if partner else "Unbekannter Nutzer"
+        status = online_status_html(partner.get("last_seen")) if partner else ""
+        their_names = ", ".join(html_lib.escape(o["card_name"]) for o in m["from_them"])
+        my_names = ", ".join(html_lib.escape(w["card_name"]) for w in m["from_me"])
+        st.markdown(
+            '<div class="panel" style="border-color:#f5c518; background:rgba(245,197,24,0.08);">'
+            '<div class="panel-label" style="color:#f5c518;">🔄 Perfekter Tausch gefunden!</div>'
+            f'<div style="margin-top:2px;"><span class="trade-owner">👤 {html_lib.escape(pname)} '
+            f'&nbsp;·&nbsp; {status}</span></div>'
+            f'<div style="margin-top:8px; font-size:0.9rem; line-height:1.5;">'
+            f'🎁 Bietet dir: <b>{their_names}</b><br/>'
+            f'📋 Du bietest: <b>{my_names}</b>'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        if partner and st.button("💬 Tausch vorschlagen", key=f"perfect_match_{m['partner_id']}",
+                                  use_container_width=True):
+            st.session_state["chat_partner_id"] = partner["id"]
+            st.session_state["current_page"] = "chat"
+            st.rerun()
+        st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
+
+
 def render_wishlist_tab(user: Dict[str, Any]) -> None:
     """Bereich „📋 Ich suche“: öffentliches Wunschlisten-Board. Jeder kann Karten, die ihm
     fehlen, draufsetzen - andere sehen das Board und können direkt über den bestehenden
     Chat (siehe chat.py) anschreiben, statt aktiv nach "Wer hat Karte X" suchen zu müssen."""
     st.markdown('<div class="section-title">📋 Ich suche</div>', unsafe_allow_html=True)
+    _render_perfect_matches(user)
 
     col_mine, col_board = st.columns([2, 3])
 
@@ -4997,6 +5031,7 @@ def render_offers_tab(user: Dict[str, Any]) -> None:
     zusätzlich pflegt trade_watch.py Dubletten automatisch mit ein (siehe offers.py -
     solche Einträge tragen ein 🤖-Badge)."""
     st.markdown('<div class="section-title">🎁 Ich biete</div>', unsafe_allow_html=True)
+    _render_perfect_matches(user)
 
     col_mine, col_board = st.columns([2, 3])
 
