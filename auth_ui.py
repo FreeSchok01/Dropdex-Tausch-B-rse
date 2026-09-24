@@ -21,6 +21,7 @@ import streamlit as st
 
 import db
 import maintenance
+import notifications
 import twitch_auth
 
 # ---------------------------------------------------------------------------
@@ -212,8 +213,24 @@ def render_login_gate() -> bool:
         st.error("🚫 Dein Account ist für dieses Tool gesperrt.")
         return False
 
-    # Normale User brauchen keine Bestätigung/Freigabe mehr, um die App zu nutzen (is_approved
-    # wird nur noch informativ im Admin-Dashboard geführt, siehe db.create_user()/init_db()).
+    # Neue Accounts starten mit is_approved = 0 (siehe db.create_user()) und müssen erst von
+    # einem Admin/Supporter im "Freigaben"-Tab des Admin-Dashboards freigeschaltet werden.
+    if not user["is_approved"]:
+        st.markdown("<div style='height: 12vh;'></div>", unsafe_allow_html=True)
+        col_l, col_mid, col_r = st.columns([1, 1.4, 1])
+        with col_mid:
+            st.markdown(
+                "<div style='text-align:center; font-size:2.4rem;'>⏳</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                "<h3 style='text-align:center; margin-top:0;'>Dein Account wartet auf Freigabe</h3>"
+                "<p style='text-align:center; color:#a2a4bd;'>"
+                "Ein Teammitglied muss deinen Account noch freischalten, bevor du die "
+                "Tauschbörse nutzen kannst. Schau später nochmal vorbei!</p>",
+                unsafe_allow_html=True,
+            )
+        return False
 
     # ---- Wartungsmodus: nur Admins kommen durch, alle anderen sehen nur diese
     # Meldung statt der eigentlichen App (siehe maintenance.py + Toggle oben). ----
@@ -462,12 +479,24 @@ def render_admin_dashboard() -> None:
                             (u["is_banned"] and _can_ban(user, u))
                         if show_ok:
                             if st.button("✅", key=f"admin_approve_{u['id']}", help="Freigeben / entbannen"):
+                                was_pending = not u["is_approved"]
                                 db.set_approved(u["id"], True)
                                 db.set_banned(u["id"], False)
+                                if was_pending:
+                                    notifications.add_notification(
+                                        u["id"], "🎉 Dein Account wurde freigegeben! Du kannst die Tauschbörse jetzt nutzen."
+                                    )
                                 st.rerun()
                     with c_ban:
                         if not u["is_banned"] and _can_ban(user, u):
-                            if st.button("🚫", key=f"admin_ban_{u['id']}", help="Bannen"):
+                            # Bei noch wartenden Accounts ist das eigentlich ein "Ablehnen" (sperrt
+                            # den Account direkt, statt ihn nur weiter warten zu lassen) - bei bereits
+                            # freigegebenen Accounts ganz normal "Bannen". Technisch dasselbe (set_banned),
+                            # nur Label/Tooltip unterscheiden sich je nach Kontext.
+                            is_reject = not u["is_approved"]
+                            icon = "❌" if is_reject else "🚫"
+                            help_txt = "Ablehnen (sperrt den Account)" if is_reject else "Bannen"
+                            if st.button(icon, key=f"admin_ban_{u['id']}", help=help_txt):
                                 db.set_banned(u["id"], True)
                                 st.rerun()
 
@@ -528,9 +557,14 @@ def render_admin_dashboard() -> None:
                     if not selected["is_approved"]:
                         if st.button("✅ Freigeben", key="admin_detail_approve", use_container_width=True, type="primary"):
                             db.set_approved(selected["id"], True)
+                            notifications.add_notification(
+                                selected["id"], "🎉 Dein Account wurde freigegeben! Du kannst die Tauschbörse jetzt nutzen."
+                            )
                             st.rerun()
                     if _can_ban(user, selected):
-                        if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
+                        is_reject = not selected["is_approved"]
+                        label = "❌ Ablehnen" if is_reject else "🚫 Bannen"
+                        if st.button(label, key="admin_detail_ban", use_container_width=True):
                             db.set_banned(selected["id"], True)
                             st.rerun()
                     elif selected["id"] != user["id"]:
