@@ -4803,8 +4803,14 @@ def _render_perfect_matches(user: Dict[str, Any]) -> None:
     """Ganz oben in "📋 Ich suche" UND "🎁 Ich biete": Hinweis, wenn ein ECHTER 1:1-Tausch
     möglich ist - ein anderer Nutzer bietet gleichzeitig etwas an, das ich suche, UND sucht
     etwas, das ich anbiete (siehe offers.get_perfect_matches()). Stärker als die normalen,
-    einseitigen Match-Hinweise (_render_match_row()), daher optisch abgehoben (gold)."""
-    matches = offers.get_perfect_matches(user["id"])
+    einseitigen Match-Hinweise (_render_match_row()), daher optisch abgehoben (gold).
+    Bewusst fehlertolerant: schlägt der Abgleich fehl (z.B. weil auf dem Server kurzzeitig
+    ein älterer Modul-Stand aktiv ist), wird dieser Block einfach übersprungen, statt den
+    ganzen Tab lahmzulegen - siehe _safe_render() in main() für die äußere Absicherung."""
+    try:
+        matches = offers.get_perfect_matches(user["id"])
+    except Exception:  # noqa: BLE001
+        return
     if not matches:
         return
     for m in matches:
@@ -5520,28 +5526,44 @@ def main() -> None:
     # ---- Keine Seltenheiten-Filter-Toolbar mehr: alle Seltenheiten werden immer angezeigt. ----
     selected_rarities: List[str] = ["SHINY", "LEGENDARY", "EPIC", "RARE", "UNCOMMON", "COMMON"]
 
+    def _safe_render(render_fn, *args) -> None:
+        """Führt eine Tab-Render-Funktion geschützt aus: ein Fehler in EINEM Tab (z.B. weil
+        auf dem Server gerade ein älterer Stand eines Moduls läuft, oder ein transienter
+        Netzwerk-/DB-Fehler) soll nie die komplette App zum Absturz bringen. Admins sehen
+        zusätzlich die technischen Details, damit sich sowas schnell debuggen lässt."""
+        try:
+            render_fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            st.error(
+                "⚠️ Dieser Bereich konnte gerade nicht geladen werden. Bitte lade die Seite "
+                "neu – falls es weiterhin passiert, sag kurz Bescheid."
+            )
+            if user.get("is_admin"):
+                with st.expander("🛠️ Technische Details (nur für Admins sichtbar)"):
+                    st.exception(exc)
+
     if page == "👤 Mein Profil":
-        render_my_profile_page(user)
+        _safe_render(render_my_profile_page, user)
     elif page == "🔍 Meine fehlende Karten":
-        render_search_section(name_map, selected_rarities, user)
+        _safe_render(render_search_section, name_map, selected_rarities, user)
     elif page == "🎯 Karte loswerden":
-        render_get_rid_tab(name_map, selected_rarities, user)
+        _safe_render(render_get_rid_tab, name_map, selected_rarities, user)
     elif page == "🔄 1:1 Tausch":
-        render_trade_tab(name_map, selected_rarities, user)
+        _safe_render(render_trade_tab, name_map, selected_rarities, user)
     elif page == "📋 Ich suche":
-        render_wishlist_tab(user)
+        _safe_render(render_wishlist_tab, user)
     elif page == "🎁 Ich biete":
-        render_offers_tab(user)
+        _safe_render(render_offers_tab, user)
     elif page == "🏆 Bestenliste":
-        render_leaderboard_tab(user)
+        _safe_render(render_leaderboard_tab, user)
     elif page == "💬 Chat":
-        render_chat_tab(user)
+        _safe_render(render_chat_tab, user)
     elif page == "🔔 News":
-        render_news_tab(user)
+        _safe_render(render_news_tab, user)
     elif page == "🛠️ Admin":
-        render_admin_tab(name_map, user)
+        _safe_render(render_admin_tab, name_map, user)
     elif page == "🧡 Supporter":
-        render_supporter_tab(name_map, user)
+        _safe_render(render_supporter_tab, name_map, user)
 
 
 if __name__ == "__main__":
