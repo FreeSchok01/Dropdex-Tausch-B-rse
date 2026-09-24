@@ -20,6 +20,11 @@ trotzdem die normale "Neue Karte erhalten"-Nachricht, nur eben ohne Partnername.
 
 Eigene, kleine SQLite-Datei – unabhängig von db.py, damit hier nichts am
 bestehenden Datenbank-Schema geändert werden muss.
+
+Zusätzlich pflegt dieses Modul automatisch das "🎁 Ich biete"-Board (siehe
+offers.py): Dubletten (×2 oder mehr) werden automatisch als Angebot
+eingetragen, sinkt der Bestand wieder auf ×0/×1 wird der Eintrag wieder
+entfernt (siehe _record_event()).
 """
 
 import os
@@ -29,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import db
 import notifications
+import offers
 
 _DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_watch.db")
 
@@ -167,6 +173,16 @@ def _record_event(user_id: int, card_id: str, card_name: str, rarity: str, direc
     A's Namen ergänzt."""
     is_new_card = direction == "gained" and prev_count == 0
     now = datetime.now().isoformat(timespec="seconds")
+
+    # ---- Automatischer Abgleich mit dem "🎁 Ich biete"-Board (siehe offers.py) ----
+    # Besitzt der Nutzer jetzt ×2 oder mehr einer Karte, hat er offensichtlich eine
+    # Dublette übrig -> automatisch als Angebot eintragen. Sinkt der Bestand später wieder
+    # auf ×0 oder ×1 (Karte abgegeben oder keine Dublette mehr übrig), wird ein SO gesetzter
+    # Eintrag wieder entfernt. Manuell gesetzte Angebote bleiben davon unberührt.
+    if direction == "gained" and cur_count > 1:
+        offers.add_offer(user_id, card_id, card_name, rarity, auto=True)
+    elif direction == "lost" and cur_count <= 1:
+        offers.remove_auto_offer(user_id, card_id)
 
     # Dubletten (gained, prev_count > 0) interessieren niemanden mehr - dafür weder News
     # noch Partner-Abgleich, damit sie auch keinen echten späteren Match "verbrauchen".
