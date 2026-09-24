@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Dropdex P2P Tausch-Matcher
@@ -42,6 +41,7 @@ import chat  # eigenständiges Mini-Modul für den "💬 Chat"-Reiter (siehe cha
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
 import maintenance  # eigenständiges Mini-Modul für den Wartungsmodus (siehe maintenance.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
+import offers  # eigenständiges Mini-Modul für das öffentliche "🎁 Ich biete"-Board (siehe offers.py)
 import trade_watch  # beobachtet das eigene Profil alle 10s auf verschwundene Karten (siehe trade_watch.py)
 import wishlist  # eigenständiges Mini-Modul für das öffentliche "📋 Ich suche"-Board (siehe wishlist.py)
 import streamlit.components.v1 as components
@@ -2864,6 +2864,102 @@ BG_IMAGE_B64 = (
     "JA/hp8dgy4fadp4oopNCSJhpzOw+Ujvmp4rJycAMR1HvRRTQRWhbgsHQ5CkD9Kmh09w+VVsDqO9FFaR2uNamlbWTSAgxsT7jke9afhuwd9XtgEYjeOooorS2hUVqf//Z"
 )
 
+# Kurzer Benachrichtigungston (Sinus-Beep, ~0.18s) als Base64-WAV eingebettet - wird
+# per _play_notification_sound() abgespielt, wenn im Hintergrund eine neue News/Chat-
+# Nachricht erkannt wird (siehe _background_trade_check()).
+NOTIFICATION_SOUND_B64 = (
+    "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"
+)
+
+
 CSS = """
 <style>
     /* ---- Leere Streamlit-Kopfleiste ganz oben komplett ausblenden ----
@@ -4820,6 +4916,20 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
     with col_board:
         st.markdown('<div class="panel-label">🌐 Öffentliches Board - wer sucht was?</div>',
                     unsafe_allow_html=True)
+
+        # ---- Automatischer Abgleich mit dem "🎁 Ich biete"-Board (siehe offers.py): welche
+        # Angebote ANDERER Nutzer passen zu Karten, die ich selbst suche? ----
+        offer_matches = offers.get_matches_for_wisher(user["id"])
+        if offer_matches:
+            st.markdown(
+                f'<div class="panel-hint" style="color:#34d399;">🎉 {len(offer_matches)} Angebot(e) '
+                f'passen zu deiner Wunschliste!</div>',
+                unsafe_allow_html=True,
+            )
+            for o in offer_matches:
+                _render_match_row(o, "gesucht → wird angeboten von", f"wishmatch_{o['id']}")
+            st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+
         board = wishlist.get_board(exclude_user_id=user["id"])
         if not board:
             st.info("Aktuell hat noch niemand etwas auf die Wunschliste gesetzt.")
@@ -4847,6 +4957,167 @@ def render_wishlist_tab(user: Dict[str, Any]) -> None:
                 if wisher and st.button("💬", key=f"wish_chat_{w['id']}", help=f"{wname} anschreiben",
                                          use_container_width=True):
                     st.session_state["chat_partner_id"] = wisher["id"]
+                    st.session_state["current_page"] = "chat"
+                    st.rerun()
+
+
+def _render_match_row(row: Dict[str, Any], owner_prefix: str, key_prefix: str) -> None:
+    """Gemeinsame Zeile für die Matching-Hinweise in render_wishlist_tab()/render_offers_tab():
+    zeigt eine einzelne passende Angebots- oder Wunsch-Zeile aus offers.py/wishlist.py samt
+    Kartenbild, Nutzername (mit Online-Status) und einem direkten "💬"-Button in den Chat."""
+    partner = db.get_user_by_id(row["user_id"])
+    pname = partner["twitch_username"] if partner else "Unbekannter Nutzer"
+    status = online_status_html(partner.get("last_seen")) if partner else ""
+    thumb_card = {"name": row["card_name"], "image_url": row.get("image_url")}
+    col_thumb, col_meta, col_action = st.columns([1, 3, 1])
+    with col_thumb:
+        st.markdown(
+            f'<div class="trade-card" style="padding:6px; border-color:#34d399;">'
+            f'{_card_thumb_html(thumb_card, row["rarity"] or "COMMON")}</div>',
+            unsafe_allow_html=True,
+        )
+    with col_meta:
+        st.markdown(
+            f'<div style="margin-top:10px;">'
+            f'<span class="trade-owner">{owner_prefix} 👤 {html_lib.escape(pname)} '
+            f'&nbsp;·&nbsp; {status}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with col_action:
+        if partner and st.button("💬", key=f"{key_prefix}_{row['id']}", help=f"{pname} anschreiben",
+                                  use_container_width=True):
+            st.session_state["chat_partner_id"] = partner["id"]
+            st.session_state["current_page"] = "chat"
+            st.rerun()
+
+
+def render_offers_tab(user: Dict[str, Any]) -> None:
+    """Bereich „🎁 Ich biete“: öffentliches Angebots-Board, Gegenstück zu „📋 Ich suche“
+    (siehe render_wishlist_tab()). Eigene Dubletten können hier manuell angeboten werden;
+    zusätzlich pflegt trade_watch.py Dubletten automatisch mit ein (siehe offers.py -
+    solche Einträge tragen ein 🤖-Badge)."""
+    st.markdown('<div class="section-title">🎁 Ich biete</div>', unsafe_allow_html=True)
+
+    col_mine, col_board = st.columns([2, 3])
+
+    with col_mine:
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">➕ Eigene Dublette anbieten</div>', unsafe_allow_html=True)
+
+        # Genau wie in „📋 Ich suche“: eigenes Profil automatisch (nach)laden.
+        own_url = (user.get("own_profile_url") or "").strip()
+        if "myprofile_inv" not in st.session_state and own_url:
+            with st.spinner("Lade dein Dropdex-Profil, um deine Dubletten zu ermitteln …"):
+                try:
+                    loaded = load_my_full_profile(own_url)
+                except Exception:  # noqa: BLE001
+                    loaded = None
+            if loaded:
+                st.session_state["myprofile_inv"] = loaded
+
+        my_inv = st.session_state.get("myprofile_inv")
+        if not my_inv and not own_url:
+            st.warning(
+                "Hinterlege zuerst dein eigenes Dropdex-Profil unter „👤 Mein Profil“ - erst dann "
+                "kann hier ermittelt werden, welche Dubletten du wirklich hast."
+            )
+        elif not my_inv:
+            st.error("Dein Profil konnte nicht geladen werden - versuche es über „👤 Mein Profil“ "
+                      "per „🔄 Profil neu laden“ erneut.")
+        if my_inv:
+            dups = [c for c in my_inv if c["count"] > 1]
+            dups.sort(key=lambda c: (RARITY_ORDER.get(c["rarity"], 99), c.get("name", "").lower()))
+
+            if dups:
+                already_ids = {o["card_id"] for o in offers.get_my_offers(user["id"])}
+                options = {
+                    f'{RARITY_LABEL_DE.get(c["rarity"], c["rarity"])} · {c.get("name", "")} ×{c["count"]}'
+                    + (" (schon angeboten)" if str(c["id"]) in already_ids else ""): c
+                    for c in dups
+                }
+                choice = st.selectbox("Dublette wählen", list(options.keys()),
+                                       key="offer_pick", label_visibility="collapsed")
+                picked = options[choice]
+                if st.button("🎁 Zum Angebot hinzufügen", key="offer_add_btn",
+                             disabled=str(picked["id"]) in already_ids, use_container_width=True):
+                    offers.add_offer(user["id"], str(picked["id"]), picked.get("name", ""),
+                                      picked.get("rarity", ""), image_url=picked.get("image_url", ""))
+                    st.rerun()
+                st.markdown(
+                    f'<div class="panel-hint">{len(dups)} Dubletten zur Auswahl. Neue Dubletten werden '
+                    f'außerdem automatisch erkannt und hier ergänzt.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Laut deinem Profil hast du aktuell keine Dubletten 🎉")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="panel">', unsafe_allow_html=True)
+        st.markdown('<div class="panel-label">📄 Meine Angebote</div>', unsafe_allow_html=True)
+        mine = offers.get_my_offers(user["id"])
+        if not mine:
+            st.caption("Noch keine Angebote eingetragen.")
+        for o in mine:
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                thumb_card = {"name": o["card_name"], "image_url": o.get("image_url")}
+                auto_tag = ' <span style="color:#8b8d9e; font-size:0.78rem;">🤖 automatisch erkannt</span>' if o.get("auto") else ""
+                st.markdown(
+                    f'<div class="trade-card"><div style="display:flex; align-items:center; gap:10px;">'
+                    f'{_card_thumb_html(thumb_card, o["rarity"] or "COMMON")}</div>{auto_tag}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button("🗑️", key=f"offer_del_{o['id']}", help="Vom Angebot entfernen"):
+                    offers.remove_offer(user["id"], o["id"])
+                    st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col_board:
+        st.markdown('<div class="panel-label">🌐 Öffentliches Board - wer bietet was?</div>',
+                    unsafe_allow_html=True)
+
+        # ---- Umgekehrte Richtung: welche Wünsche ANDERER Nutzer passen zu Karten, die ich
+        # selbst anbiete? ----
+        wish_matches = offers.get_matches_for_offerer(user["id"])
+        if wish_matches:
+            st.markdown(
+                f'<div class="panel-hint" style="color:#34d399;">👀 {len(wish_matches)} Nutzer '
+                f'suchen genau das, was du anbietest!</div>',
+                unsafe_allow_html=True,
+            )
+            for w in wish_matches:
+                _render_match_row(w, "gesucht von", f"offermatch_{w['id']}")
+            st.markdown('<hr class="side-divider">', unsafe_allow_html=True)
+
+        board = offers.get_board(exclude_user_id=user["id"])
+        if not board:
+            st.info("Aktuell bietet noch niemand etwas an.")
+            return
+        for o in board:
+            offerer = db.get_user_by_id(o["user_id"])
+            oname = offerer["twitch_username"] if offerer else "Unbekannter Nutzer"
+            status = online_status_html(offerer.get("last_seen")) if offerer else ""
+            thumb_card = {"name": o["card_name"], "image_url": o.get("image_url")}
+            col_thumb, col_meta, col_action = st.columns([1, 3, 1])
+            with col_thumb:
+                st.markdown(
+                    f'<div class="trade-card" style="padding:6px;">'
+                    f'{_card_thumb_html(thumb_card, o["rarity"] or "COMMON")}</div>',
+                    unsafe_allow_html=True,
+                )
+            with col_meta:
+                st.markdown(
+                    f'<div style="margin-top:10px;">'
+                    f'<span class="trade-owner">angeboten von 👤 {html_lib.escape(oname)} '
+                    f'&nbsp;·&nbsp; {status}</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with col_action:
+                if offerer and st.button("💬", key=f"offer_chat_{o['id']}", help=f"{oname} anschreiben",
+                                          use_container_width=True):
+                    st.session_state["chat_partner_id"] = offerer["id"]
                     st.session_state["current_page"] = "chat"
                     st.rerun()
 
@@ -5048,6 +5319,7 @@ SIDEBAR_NAV_GROUPS: List[Tuple[str, List[Tuple[str, str, str]]]] = [
         ("getrid", "🎯", "Karte loswerden"),
         ("trade", "🔄", "1:1 Tausch"),
         ("wishlist", "📋", "Ich suche"),
+        ("offers", "🎁", "Ich biete"),
         ("leaderboard", "🏆", "Bestenliste"),
         ("chat", "💬", "Chat"),
         ("news", "🔔", "News"),
@@ -5059,6 +5331,7 @@ SIDEBAR_PAGE_LABELS: Dict[str, str] = {
     "getrid": "🎯 Karte loswerden",
     "trade": "🔄 1:1 Tausch",
     "wishlist": "📋 Ich suche",
+    "offers": "🎁 Ich biete",
     "leaderboard": "🏆 Bestenliste",
     "chat": "💬 Chat",
     "news": "🔔 News",
@@ -5115,6 +5388,19 @@ def _sidebar_nav_fragment(user: Dict[str, Any]) -> str:
     return render_sidebar_nav(user)
 
 
+def _play_notification_sound() -> None:
+    """Spielt einen kurzen Benachrichtigungston ab (siehe NOTIFICATION_SOUND_B64, eingebettet
+    als Base64-WAV). Manche Browser blockieren Autoplay-Audio ohne vorherige
+    Nutzerinteraktion auf der Seite - das ist eine reine Browser-Einschränkung, die hier
+    bewusst ignoriert wird (best effort, kein Fehler für den Rest der App)."""
+    components.html(
+        f'<audio autoplay style="display:none;">'
+        f'<source src="data:audio/wav;base64,{NOTIFICATION_SOUND_B64}" type="audio/wav">'
+        f'</audio>',
+        height=0,
+    )
+
+
 @st.fragment(run_every=5)
 def _background_trade_check(user_id: int, own_url: str) -> None:
     """Prüft alle 5 Sekunden im Hintergrund, ob sich am eigenen Kartenprofil etwas verändert
@@ -5123,17 +5409,36 @@ def _background_trade_check(user_id: int, own_url: str) -> None:
     als beim alten JS-`window.location.reload()`-Timer gibt es dadurch nie einen echten
     Seiten-Reload (keine verlorene Eingabe, kein Scroll-Sprung, kein Tab-Wechsel-Reset).
 
-    Findet der Check eine Veränderung (= neue Nachricht in "🔔 News"), poppt zusätzlich ein
-    Toast auf - so sieht man es direkt auf der Seite, statt erst manuell im News-Tab
-    nachschauen zu müssen."""
+    Findet der Check eine neue Nachricht in "🔔 News" ODER "💬 Chat", poppt zusätzlich ein
+    Toast (+ kurzer Ton, siehe _play_notification_sound()) auf - so sieht man es direkt auf
+    der Seite, statt erst manuell im jeweiligen Reiter nachschauen zu müssen. Die vorherigen
+    Zählerstände werden bewusst in session_state gehalten (nicht nur "vor/nach diesem Tick"),
+    damit auch Nachrichten erkannt werden, die zwischen zwei Ticks von AUSSEN entstanden sind
+    - z.B. eine Freigabe-Nachricht durch einen Admin oder eine Chat-Nachricht eines anderen
+    Nutzers, die nicht von trade_watch.maybe_check() selbst ausgelöst wurde."""
     if own_url:
-        before = notifications.unread_count(user_id)
         trade_watch.maybe_check(user_id, lambda: load_my_full_profile(own_url))
-        after = notifications.unread_count(user_id)
-        if after > before:
-            new_items = notifications.get_notifications(user_id, limit=after - before)
-            for n in reversed(new_items):  # älteste zuerst anzeigen
-                st.toast(n["message"], icon="🔔")
+
+    prev_news = st.session_state.get("_prev_unread_news")
+    prev_chat = st.session_state.get("_prev_unread_chat")
+    cur_news = notifications.unread_count(user_id)
+    cur_chat = chat.unread_count(user_id)
+
+    got_something_new = False
+    if prev_news is not None and cur_news > prev_news:
+        new_items = notifications.get_notifications(user_id, limit=cur_news - prev_news)
+        for n in reversed(new_items):  # älteste zuerst anzeigen
+            st.toast(n["message"], icon="🔔")
+        got_something_new = True
+    if prev_chat is not None and cur_chat > prev_chat:
+        st.toast("💬 Neue Chat-Nachricht erhalten.", icon="💬")
+        got_something_new = True
+
+    if got_something_new:
+        _play_notification_sound()
+
+    st.session_state["_prev_unread_news"] = cur_news
+    st.session_state["_prev_unread_chat"] = cur_chat
 
 
 def main() -> None:
@@ -5160,6 +5465,7 @@ def main() -> None:
     trade_watch.init_db()
     chat.init_db()
     wishlist.init_db()
+    offers.init_db()
     user = st.session_state["auth_user"]
     db.touch_last_seen(user["id"])
 
@@ -5189,6 +5495,8 @@ def main() -> None:
         render_trade_tab(name_map, selected_rarities, user)
     elif page == "📋 Ich suche":
         render_wishlist_tab(user)
+    elif page == "🎁 Ich biete":
+        render_offers_tab(user)
     elif page == "🏆 Bestenliste":
         render_leaderboard_tab(user)
     elif page == "💬 Chat":
