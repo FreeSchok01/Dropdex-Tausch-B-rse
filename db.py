@@ -13,37 +13,10 @@ Tabelle `users`:
     is_admin            INTEGER (0/1)
     is_supporter        INTEGER (0/1)    (Moderations-Rang unterhalb Admin, siehe Freigaben)
     is_banned           INTEGER (0/1)
-    is_approved         INTEGER (0/1)    (muss von Admin/Supporter freigegeben werden)
+    is_approved         INTEGER (0/1)    (muss von Admin freigegeben werden)
     last_login          TEXT (ISO-Zeitstempel, UTC)
     own_profile_url     TEXT             (eigenes, privates Dropdex-Profil des Accounts)
     own_profile_name    TEXT
-
-Tabelle `progress_snapshots` (Verlauf des Sammelfortschritts pro Nutzer):
-    id                  INTEGER PRIMARY KEY
-    user_id             INTEGER          (-> users.id)
-    taken_at            TEXT (ISO-Zeitstempel, UTC)
-    distinct_owned      INTEGER          (verschiedene besessene Karten)
-    distinct_total      INTEGER          (verschiedene Karten insgesamt im Profil)
-    total_copies        INTEGER          (Karten insgesamt inkl. Dubletten)
-    missing_count       INTEGER          (fehlende, verschiedene Karten)
-
-Tabelle `sessions` ("eingeloggt bleiben" über ?session=... in der URL):
-    token               TEXT PRIMARY KEY (zufälliges Token, landet in der URL)
-    twitch_id           TEXT             (-> users.twitch_id)
-    created_at          TEXT (ISO-Zeitstempel, UTC)
-    expires_at          TEXT (ISO-Zeitstempel, UTC; nach SESSION_TTL_DAYS abgelaufen)
-
-Tabelle `favorites` (Favoriten-Schnellauswahl je Account, siehe profile_picker()):
-    user_id             INTEGER          (-> users.id)
-    profile_url         TEXT             (Schlüssel wie in name_map/dropdex_namen.json)
-    profile_name        TEXT             (Anzeigename zum Zeitpunkt des Favorisierens)
-    created_at          TEXT (ISO-Zeitstempel, UTC)
-
-Zusätzliche Spalten in `users` (nachträglich per _ensure_column ergänzt):
-    last_seen              TEXT (ISO-Zeitstempel, UTC) - für den Online-Status in der Chat-Liste,
-                            wird bei jedem Seitenaufruf per touch_last_seen() aktualisiert.
-    show_on_leaderboard    INTEGER (0/1, Default 1) - Opt-out für die öffentliche Bestenliste
-                            (basiert auf progress_snapshots, siehe get_leaderboard()).
 """
 
 import secrets
@@ -53,14 +26,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import notifications  # für die Admin/Supporter-Benachrichtigung bei neuer Registrierung (siehe create_user())
+import notifications
 
-# Liegt neben der App -> bei Neustart bleibt sie erhalten, solange der
-# Speicher des Hosters nicht flüchtig ist (siehe Hinweis im Admin-Panel
-# der Haupt-App zu dropdex_namen.json - gilt hier analog).
 DB_PATH = Path(__file__).with_name("dropdex_users.db")
-
-# "Eingeloggt bleiben": so lange ist ein Session-Token nach dem Login gültig.
 SESSION_TTL_DAYS = 30
 
 
@@ -76,16 +44,14 @@ def get_connection():
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    """Fügt eine Spalte nachträglich hinzu, falls sie in einer bestehenden DB noch fehlt
-    (SQLite kennt kein 'ADD COLUMN IF NOT EXISTS', daher der try/except-Umweg)."""
+    """Fügt eine Spalte nachträglich hinzu, falls sie in einer bestehenden DB noch fehlt."""
     cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def init_db() -> None:
-    """Legt die Tabellen an, falls sie noch nicht existieren, und ergänzt fehlende
-    Spalten in bereits bestehenden Datenbanken. Idempotent."""
+    """Legt die Tabellen an und führt einmalig eine Zurücksetzung aller Nicht-Admin-Accounts aus."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -95,6 +61,8 @@ def init_db() -> None:
                 twitch_username    TEXT NOT NULL,
                 profile_image_url  TEXT DEFAULT '',
                 is_admin           INTEGER NOT NULL DEFAULT 0,
+                is_supporter       INTEGER NOT NULL DEFAULT 0,
+                is_approved        INTEGER NOT NULL DEFAULT 0,
                 is_banned          INTEGER NOT NULL DEFAULT 0,
                 last_login         TEXT
             )
@@ -104,16 +72,29 @@ def init_db() -> None:
         _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
         _ensure_column(conn, "users", "last_seen", "TEXT")
         _ensure_column(conn, "users", "show_on_leaderboard", "INTEGER NOT NULL DEFAULT 1")
-
-        cols_before = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-        newly_added_approved = "is_approved" not in cols_before
         _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
-        if newly_added_approved:
-            # Bestandsnutzer, die es schon vor der Freigabepflicht gab, waren faktisch immer
-            # schon freigeschaltet -> nicht nachträglich aussperren, nur künftige Neuanmeldungen
-            # (INSERT in create_user) starten mit is_approved = 0.
-            conn.execute("UPDATE users SET is_approved = 1")
+
+        # System-Tabelle für Migrationen
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+
+        # Einmaliger Reset: Alle bestehenden User & Supporter (außer Admins) auf is_approved = 0 setzen
+        migration_check = conn.execute(
+            "SELECT value FROM system_settings WHERE key = 'reset_all_approvals_v1'"
+        ).fetchone()
+
+        if not migration_check:
+            conn.execute("UPDATE users SET is_approved = 0 WHERE is_admin = 0")
+            conn.execute(
+                "INSERT INTO system_settings (key, value) VALUES ('reset_all_approvals_v1', '1')"
+            )
 
         conn.execute(
             """
@@ -169,10 +150,6 @@ def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def _notify_moderators_of_pending_signup(twitch_username: str) -> None:
-    """Benachrichtigt alle Admins/Supporter über einen neuen, wartenden Account (siehe
-    create_user()) - sonst würde eine Registrierung sonst niemand bemerken, außer man schaut
-    zufällig ins "Freigaben"-Tab des Admin-Dashboards. Eigenes try/except, damit ein Problem
-    hier NIE den Login selbst verhindern kann."""
     try:
         notifications.init_db()
         with get_connection() as conn:
@@ -181,13 +158,11 @@ def _notify_moderators_of_pending_signup(twitch_username: str) -> None:
             ).fetchall()
         for m in mods:
             notifications.add_notification(m["id"], f"🆕 {twitch_username} wartet auf Freigabe.")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
 def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
-    """Legt einen neuen Nutzer an. Muss erst von einem Admin/Supporter im "Freigaben"-Tab
-    freigeschaltet werden (is_approved = 0), bevor render_login_gate() ihn in die App lässt."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
@@ -200,7 +175,6 @@ def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "
 
 
 def touch_last_login(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> None:
-    """Aktualisiert last_login + ggf. geänderten Namen/Avatar bei jedem Login."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
@@ -211,7 +185,6 @@ def touch_last_login(twitch_id: str, twitch_username: str, profile_image_url: st
 
 
 def get_or_create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
-    """Kernfunktion für den Login: legt den Nutzer bei Erstlogin an, sonst last_login updaten."""
     existing = get_user_by_twitch_id(twitch_id)
     if existing is None:
         return create_user(twitch_id, twitch_username, profile_image_url)
@@ -220,8 +193,6 @@ def get_or_create_user(twitch_id: str, twitch_username: str, profile_image_url: 
 
 
 def search_users_by_username(query: str, exclude_user_id: Optional[int] = None, limit: int = 20) -> List[Dict[str, Any]]:
-    """Sucht registrierte, nicht gesperrte Nutzer per (Teil-)Twitch-Username - für die
-    Chat-Suche ("💬 Chat" -> Nutzer per Namen finden, unabhängig von Tausch-Matches)."""
     q = (query or "").strip()
     if not q:
         return []
@@ -253,7 +224,6 @@ def set_banned(user_id: int, banned: bool) -> None:
 def set_admin(user_id: int, admin: bool) -> None:
     with get_connection() as conn:
         if admin:
-            # Wer Admin wird, ist damit automatisch auch freigegeben.
             conn.execute("UPDATE users SET is_admin = 1, is_approved = 1 WHERE id = ?", (user_id,))
         else:
             conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
@@ -262,8 +232,7 @@ def set_admin(user_id: int, admin: bool) -> None:
 def set_supporter(user_id: int, supporter: bool) -> None:
     with get_connection() as conn:
         if supporter:
-            # Wer Supporter wird, ist damit automatisch auch freigegeben.
-            conn.execute("UPDATE users SET is_supporter = 1, is_approved = 1 WHERE id = ?", (user_id,))
+            conn.execute("UPDATE users SET is_supporter = 1 WHERE id = ?", (user_id,))
         else:
             conn.execute("UPDATE users SET is_supporter = 0 WHERE id = ?", (user_id,))
 
@@ -274,23 +243,15 @@ def set_approved(user_id: int, approved: bool) -> None:
 
 
 def touch_last_seen(user_id: int) -> None:
-    """Aktualisiert den 'zuletzt aktiv'-Zeitstempel - wird bei jedem Seitenaufruf (main())
-    aufgerufen, damit die Chat-Liste und das Admin-Dashboard einen groben Online-Status
-    anzeigen können."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, user_id))
 
 
-# Innerhalb dieser Zeitspanne seit dem letzten Seitenaufruf/Fragment-Tick gilt ein Account
-# als "online" - einzige Quelle der Wahrheit, genutzt von der Chat-Liste UND vom
-# Moderations-Dashboard (siehe auth_ui.render_admin_dashboard()).
 ONLINE_THRESHOLD_SECONDS = 5 * 60
 
 
 def is_user_online(last_seen: Optional[str]) -> bool:
-    """True, wenn `last_seen` (ISO-Zeitstempel aus touch_last_seen()) innerhalb von
-    ONLINE_THRESHOLD_SECONDS liegt."""
     if not last_seen:
         return False
     try:
@@ -303,7 +264,6 @@ def is_user_online(last_seen: Optional[str]) -> bool:
 
 
 def set_leaderboard_visible(user_id: int, visible: bool) -> None:
-    """Opt-in/-out für die öffentliche Bestenliste (Standard: sichtbar)."""
     with get_connection() as conn:
         conn.execute(
             "UPDATE users SET show_on_leaderboard = ? WHERE id = ?",
@@ -312,8 +272,6 @@ def set_leaderboard_visible(user_id: int, visible: bool) -> None:
 
 
 def get_pending_users() -> List[Dict[str, Any]]:
-    """Nutzer, die sich eingeloggt haben, aber noch nicht von einem Admin/Supporter
-    freigegeben wurden (und nicht gesperrt sind) - für den „Freigaben“-Bereich."""
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY last_login DESC NULLS LAST"
@@ -321,23 +279,13 @@ def get_pending_users() -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Eigenes (privates) Profil je Account
-# ---------------------------------------------------------------------------
-
 def set_own_profile(user_id: int, url: str, name: str) -> None:
-    """Speichert/aktualisiert das private Dropdex-Profil des eingeloggten Nutzers.
-    Leere Strings (url='') entfernen die Hinterlegung wieder."""
     with get_connection() as conn:
         conn.execute(
             "UPDATE users SET own_profile_url = ?, own_profile_name = ? WHERE id = ?",
             (url.strip(), name.strip(), user_id),
         )
 
-
-# ---------------------------------------------------------------------------
-# Fortschrittsverlauf ("Gesamtfortschritt") je Account
-# ---------------------------------------------------------------------------
 
 def add_progress_snapshot(
     user_id: int,
@@ -346,8 +294,6 @@ def add_progress_snapshot(
     total_copies: int,
     missing_count: int,
 ) -> None:
-    """Speichert einen neuen Fortschritts-Schnappschuss (z.B. bei jedem Laden des
-    eigenen Profils in der Kartensuche)."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
@@ -359,8 +305,6 @@ def add_progress_snapshot(
 
 
 def get_progress_history(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    """Liefert die letzten Fortschritts-Schnappschüsse eines Nutzers, älteste zuerst
-    (praktisch für Verlaufs-Charts)."""
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT ?",
@@ -379,10 +323,6 @@ def get_latest_progress(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def get_leaderboard(limit: int = 50) -> List[Dict[str, Any]]:
-    """Öffentliche Bestenliste: für jeden nicht gesperrten Nutzer mit
-    show_on_leaderboard = 1 der jeweils NEUESTE Fortschritts-Schnappschuss, sortiert nach
-    verschiedenen besessenen Karten (dann nach Karten insgesamt) absteigend. Nutzer ohne
-    einen einzigen Snapshot (Profil noch nie geladen) tauchen hier nicht auf."""
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -404,13 +344,7 @@ def get_leaderboard(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Sessions ("eingeloggt bleiben" per Token in der URL, siehe auth_ui.py)
-# ---------------------------------------------------------------------------
-
 def create_session(twitch_id: str) -> str:
-    """Erzeugt ein neues, zufälliges Session-Token für diesen Nutzer und speichert es
-    mit Ablaufzeit (SESSION_TTL_DAYS). Gibt das Token zurück, das in die URL kommt."""
     token = secrets.token_urlsafe(32)
     now = datetime.now(timezone.utc)
     expires = now + timedelta(days=SESSION_TTL_DAYS)
@@ -423,8 +357,6 @@ def create_session(twitch_id: str) -> str:
 
 
 def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
-    """Liefert den Nutzer zu einem Session-Token, sofern es existiert und noch nicht
-    abgelaufen ist - sonst None."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         row = conn.execute(
@@ -450,13 +382,7 @@ def delete_expired_sessions() -> None:
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
 
 
-# ---------------------------------------------------------------------------
-# Favoriten (Schnellauswahl je Account, siehe profile_picker() in der App)
-# ---------------------------------------------------------------------------
-
 def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
-    """Merkt sich `profile_url` als Favorit für `user_id`. Erneutes Favorisieren
-    aktualisiert nur den gespeicherten Namen (z.B. falls er sich geändert hat)."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
@@ -485,8 +411,6 @@ def is_favorite(user_id: int, profile_url: str) -> bool:
 
 
 def get_favorites(user_id: int) -> List[Dict[str, Any]]:
-    """Alle Favoriten von `user_id`, alphabetisch nach Name - für die Favoriten-
-    Schnellauswahl in profile_picker()."""
     with get_connection() as conn:
         rows = conn.execute(
             "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
