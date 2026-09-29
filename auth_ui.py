@@ -46,14 +46,14 @@ def render_user_management(current_user: dict) -> None:
                         st.success(f"{u['twitch_username']} wurde freigegeben!")
                         st.rerun()
 
-    # TAB 2: Übersicht aller Benutzer
+    # TAB 2: Übersicht aller Benutzer (Einzelne Freigabe verwalten/entziehen)
     with tab_objects[1]:
         st.subheader("Übersicht aller Konten")
         for u in users:
-            with st.expander(
-                f"{u['twitch_username']} "
-                f"({'Admin' if u.get('is_admin') else 'Supporter' if u.get('is_supporter') else 'Normaler User'})"
-            ):
+            role_label = "Admin" if u.get("is_admin") else ("Supporter" if u.get("is_supporter") else "Normaler User")
+            status_label = "🟢 Freigegeben" if u.get("is_approved") else "🔴 Gesperrt / Nicht freigegeben"
+            
+            with st.expander(f"{u['twitch_username']} — [{role_label}] — {status_label}"):
                 col_info, col_actions = st.columns([2, 2])
 
                 with col_info:
@@ -63,23 +63,38 @@ def render_user_management(current_user: dict) -> None:
                     st.write(f"**Letzter Login:** {u['last_login']}")
 
                 with col_actions:
-                    # Status: Freigabe
-                    is_app = bool(u.get("is_approved"))
-                    new_app = st.checkbox(
-                        "Account freigegeben",
-                        value=is_app,
-                        key=f"check_app_{u['id']}",
-                        disabled=bool(u.get("is_admin")),  # Admins können sich nicht selbst sperren
-                    )
-                    if new_app != is_app:
-                        db.toggle_user_approval(u["id"], new_app)
-                        st.rerun()
+                    st.write("**Freigabe-Status verwalten:**")
+                    
+                    # Verhindere, dass Admins sich selbst die Freigabe entziehen
+                    is_self_admin = bool(u.get("is_admin") and u["id"] == current_user["id"])
 
-                    # Status: Supporter (Nur Admins können Supporter vergeben)
+                    if u.get("is_approved"):
+                        if st.button(
+                            "🚫 Freigabe entziehen",
+                            key=f"btn_revoke_{u['id']}",
+                            type="secondary",
+                            disabled=is_self_admin,
+                        ):
+                            db.toggle_user_approval(u["id"], False)
+                            st.warning(f"Freigabe für {u['twitch_username']} wurde entzogen.")
+                            st.rerun()
+                    else:
+                        if st.button(
+                            "✅ Freigeben",
+                            key=f"btn_approve_{u['id']}",
+                            type="primary",
+                        ):
+                            db.toggle_user_approval(u["id"], True)
+                            st.success(f"{u['twitch_username']} wurde freigegeben.")
+                            st.rerun()
+
+                    st.divider()
+
+                    # Supporter-Status anpassen (Nur Admins)
                     if current_user.get("is_admin"):
                         is_sup = bool(u.get("is_supporter"))
                         new_sup = st.checkbox(
-                            "Supporter-Rechte",
+                            "Supporter-Rechte gewähren",
                             value=is_sup,
                             key=f"check_sup_{u['id']}",
                             disabled=bool(u.get("is_admin")),
@@ -88,12 +103,12 @@ def render_user_management(current_user: dict) -> None:
                             db.toggle_user_supporter(u["id"], new_sup)
                             st.rerun()
 
-    # TAB 3: Massen-Aktionen (Nur für Admins sichtbar)
+    # TAB 3: Massen-Aktionen (Nur für Admins)
     if current_user.get("is_admin") and len(tab_objects) > 2:
         with tab_objects[2]:
             st.subheader("🚨 Massen-Aktionen & Zurücksetzen")
 
-            # Option A: Nur normale User sperren
+            # Option 1: Nur normale User sperren
             st.markdown("### 1. Freigabe nur von normalen Usern entziehen")
             st.info(
                 "Entzieht allen normalen Benutzern die Freigabe. "
@@ -116,7 +131,7 @@ def render_user_management(current_user: dict) -> None:
 
             st.divider()
 
-            # Option B: Alle sperren (inkl. Supporter)
+            # Option 2: Alle sperren (inkl. Supporter)
             st.markdown("### 2. Freigabe von ALLEN entziehen (inkl. Supporter)")
             st.warning(
                 "Achtung: Diese Aktion entzieht **allen** Benutzern und Supportern auf einmal die Freigabe. "
