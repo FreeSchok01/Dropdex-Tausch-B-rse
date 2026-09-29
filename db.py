@@ -2,21 +2,7 @@
 """
 db.py
 =====
-Leichtgewichtige SQLite-Datenbank für die Nutzerverwaltung (Twitch-Login,
-Admin- und Bann-Status). Wird von auth_ui.py verwendet.
-
-Tabelle `users`:
-    id                  INTEGER PRIMARY KEY
-    twitch_id           TEXT UNIQUE      (eindeutige Twitch-User-ID)
-    twitch_username     TEXT             (aktueller Anzeigename)
-    profile_image_url   TEXT
-    is_admin            INTEGER (0/1)
-    is_supporter        INTEGER (0/1)    (Moderations-Rang unterhalb Admin, siehe Freigaben)
-    is_banned           INTEGER (0/1)
-    is_approved         INTEGER (0/1)    (muss von Admin freigegeben werden)
-    last_login          TEXT (ISO-Zeitstempel, UTC)
-    own_profile_url     TEXT             (eigenes, privates Dropdex-Profil des Accounts)
-    own_profile_name    TEXT
+SQLite-Datenbankverwaltung für die Dropdex-Anwendung.
 """
 
 import secrets
@@ -51,7 +37,7 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 
 
 def init_db() -> None:
-    """Legt die Tabellen an und führt einmalig eine Zurücksetzung aller Nicht-Admin-Accounts aus."""
+    """Legt alle Tabellen an und stellt sicher, dass erforderliche Spalten existieren."""
     with get_connection() as conn:
         conn.execute(
             """
@@ -74,27 +60,6 @@ def init_db() -> None:
         _ensure_column(conn, "users", "show_on_leaderboard", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
-
-        # System-Tabelle für Migrationen
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
-
-        # Einmaliger Reset: Alle bestehenden User & Supporter (außer Admins) auf is_approved = 0 setzen
-        migration_check = conn.execute(
-            "SELECT value FROM system_settings WHERE key = 'reset_all_approvals_v1'"
-        ).fetchone()
-
-        if not migration_check:
-            conn.execute("UPDATE users SET is_approved = 0 WHERE is_admin = 0")
-            conn.execute(
-                "INSERT INTO system_settings (key, value) VALUES ('reset_all_approvals_v1', '1')"
-            )
 
         conn.execute(
             """
@@ -240,6 +205,13 @@ def set_supporter(user_id: int, supporter: bool) -> None:
 def set_approved(user_id: int, approved: bool) -> None:
     with get_connection() as conn:
         conn.execute("UPDATE users SET is_approved = ? WHERE id = ?", (1 if approved else 0, user_id))
+
+
+def revoke_all_approvals_except_admins() -> int:
+    """Entzieht allen normalen Usern und Supportern (außer Admins) sofort die Freigabe."""
+    with get_connection() as conn:
+        cursor = conn.execute("UPDATE users SET is_approved = 0 WHERE is_admin = 0")
+        return cursor.rowcount
 
 
 def touch_last_seen(user_id: int) -> None:
