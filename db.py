@@ -1,120 +1,47 @@
-# -*- coding: utf-8 -*-
-"""
-db.py
-=====
-SQLite-Datenbankverwaltung für die Dropdex-Anwendung.
-"""
-
-import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-
 import notifications
 
-DB_PATH = Path(__file__).with_name("dropdex_users.db")
-SESSION_TTL_DAYS = 30
+DB_NAME = "database.db"
 
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    """Fügt eine Spalte nachträglich hinzu, falls sie in einer bestehenden DB noch fehlt."""
-    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-
-
 def init_db() -> None:
-    """Legt alle Tabellen an und stellt sicher, dass erforderliche Spalten existieren."""
+    """Initialisiert die Datenbank-Tabellen."""
     with get_connection() as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                twitch_id          TEXT NOT NULL UNIQUE,
-                twitch_username    TEXT NOT NULL,
-                profile_image_url  TEXT DEFAULT '',
-                is_admin           INTEGER NOT NULL DEFAULT 0,
-                is_supporter       INTEGER NOT NULL DEFAULT 0,
-                is_approved        INTEGER NOT NULL DEFAULT 0,
-                is_banned          INTEGER NOT NULL DEFAULT 0,
-                last_login         TEXT
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                twitch_id TEXT UNIQUE NOT NULL,
+                twitch_username TEXT NOT NULL,
+                profile_image_url TEXT,
+                last_login TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0,
+                is_supporter INTEGER NOT NULL DEFAULT 0,
+                is_approved INTEGER NOT NULL DEFAULT 0
             )
             """
         )
-        _ensure_column(conn, "users", "own_profile_url", "TEXT DEFAULT ''")
-        _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
-        _ensure_column(conn, "users", "last_seen", "TEXT")
-        _ensure_column(conn, "users", "show_on_leaderboard", "INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS progress_snapshots (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id         INTEGER NOT NULL,
-                taken_at        TEXT NOT NULL,
-                distinct_owned  INTEGER NOT NULL,
-                distinct_total  INTEGER NOT NULL,
-                total_copies    INTEGER NOT NULL,
-                missing_count   INTEGER NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                token       TEXT PRIMARY KEY,
-                twitch_id   TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                expires_at  TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS favorites (
-                user_id       INTEGER NOT NULL,
-                profile_url   TEXT NOT NULL,
-                profile_name  TEXT NOT NULL,
-                created_at    TEXT NOT NULL,
-                PRIMARY KEY (user_id, profile_url)
-            )
-            """
-        )
-
-
-def get_user_by_twitch_id(twitch_id: str) -> Optional[Dict[str, Any]]:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE twitch_id = ?", (twitch_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-        return dict(row) if row else None
 
 
 def _notify_moderators_of_pending_signup(twitch_username: str) -> None:
+    """Sendet eine Benachrichtigung an alle Admins und Supporter, wenn ein neuer User auf Freigabe wartet."""
     try:
         notifications.init_db()
         with get_connection() as conn:
@@ -122,12 +49,26 @@ def _notify_moderators_of_pending_signup(twitch_username: str) -> None:
                 "SELECT id FROM users WHERE is_admin = 1 OR is_supporter = 1"
             ).fetchall()
         for m in mods:
-            notifications.add_notification(m["id"], f"🆕 {twitch_username} wartet auf Freigabe.")
+            notifications.add_notification(
+                m["id"], f"⏳ Der User **{twitch_username}** wartet auf eine Freigabe."
+            )
     except Exception:
         pass
 
 
-def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
+def get_user_by_twitch_id(twitch_id: str) -> Optional[Dict[str, Any]]:
+    """Sucht einen User anhand seiner Twitch-ID."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE twitch_id = ?", (twitch_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def create_user(
+    twitch_id: str, twitch_username: str, profile_image_url: str = ""
+) -> Dict[str, Any]:
+    """Erstellt einen neuen User und benachrichtigt Moderatoren."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
         conn.execute(
@@ -139,253 +80,62 @@ def create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "
     return get_user_by_twitch_id(twitch_id)
 
 
-def touch_last_login(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> None:
+def update_last_login(twitch_id: str, profile_image_url: str = "") -> None:
+    """Aktualisiert den Zeitstempel des letzten Logins und das Profilbild."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with get_connection() as conn:
-        conn.execute(
-            "UPDATE users SET last_login = ?, twitch_username = ?, profile_image_url = ? "
-            "WHERE twitch_id = ?",
-            (now, twitch_username, profile_image_url, twitch_id),
-        )
-
-
-def get_or_create_user(twitch_id: str, twitch_username: str, profile_image_url: str = "") -> Dict[str, Any]:
-    existing = get_user_by_twitch_id(twitch_id)
-    if existing is None:
-        return create_user(twitch_id, twitch_username, profile_image_url)
-    touch_last_login(twitch_id, twitch_username, profile_image_url)
-    return get_user_by_twitch_id(twitch_id)
-
-
-def search_users_by_username(query: str, exclude_user_id: Optional[int] = None, limit: int = 20) -> List[Dict[str, Any]]:
-    q = (query or "").strip()
-    if not q:
-        return []
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE twitch_username LIKE ? AND is_banned = 0 "
-            "ORDER BY twitch_username COLLATE NOCASE LIMIT ?",
-            (f"%{q}%", limit),
-        ).fetchall()
-    results = [dict(r) for r in rows]
-    if exclude_user_id is not None:
-        results = [r for r in results if r["id"] != exclude_user_id]
-    return results
+        if profile_image_url:
+            conn.execute(
+                "UPDATE users SET last_login = ?, profile_image_url = ? WHERE twitch_id = ?",
+                (now, profile_image_url, twitch_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE users SET last_login = ? WHERE twitch_id = ?",
+                (now, twitch_id),
+            )
 
 
 def get_all_users() -> List[Dict[str, Any]]:
+    """Gibt alle registrierten User zurück."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM users ORDER BY last_login DESC NULLS LAST"
+            "SELECT * FROM users ORDER BY twitch_username ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def set_banned(user_id: int, banned: bool) -> None:
+def toggle_user_approval(user_id: int, is_approved: bool) -> None:
+    """Aktiviert oder deaktiviert den Freigabestatus eines Users."""
+    val = 1 if is_approved else 0
     with get_connection() as conn:
-        conn.execute("UPDATE users SET is_banned = ? WHERE id = ?", (1 if banned else 0, user_id))
+        conn.execute(
+            "UPDATE users SET is_approved = ? WHERE id = ?", (val, user_id)
+        )
 
 
-def set_admin(user_id: int, admin: bool) -> None:
+def toggle_user_supporter(user_id: int, is_supporter: bool) -> None:
+    """Setzt oder entfernt den Supporter-Status eines Users."""
+    val = 1 if is_supporter else 0
     with get_connection() as conn:
-        if admin:
-            conn.execute("UPDATE users SET is_admin = 1, is_approved = 1 WHERE id = ?", (user_id,))
-        else:
-            conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (user_id,))
+        conn.execute(
+            "UPDATE users SET is_supporter = ? WHERE id = ?", (val, user_id)
+        )
 
 
-def set_supporter(user_id: int, supporter: bool) -> None:
+def revoke_all_approvals_except_admins_and_supporters() -> int:
+    """Entzieht allen normalen Usern die Freigabe. Admins und Supporter behalten sie."""
     with get_connection() as conn:
-        if supporter:
-            conn.execute("UPDATE users SET is_supporter = 1 WHERE id = ?", (user_id,))
-        else:
-            conn.execute("UPDATE users SET is_supporter = 0 WHERE id = ?", (user_id,))
-
-
-def set_approved(user_id: int, approved: bool) -> None:
-    with get_connection() as conn:
-        conn.execute("UPDATE users SET is_approved = ? WHERE id = ?", (1 if approved else 0, user_id))
-
-
-def revoke_all_approvals_except_admins() -> int:
-    """Entzieht allen normalen Usern und Supportern (außer Admins) sofort die Freigabe."""
-    with get_connection() as conn:
-        cursor = conn.execute("UPDATE users SET is_approved = 0 WHERE is_admin = 0")
+        cursor = conn.execute(
+            "UPDATE users SET is_approved = 0 WHERE is_admin = 0 AND is_supporter = 0"
+        )
         return cursor.rowcount
 
 
-def touch_last_seen(user_id: int) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+def revoke_all_approvals_except_admins() -> int:
+    """Entzieht allen Usern inkl. Supporter die Freigabe. Nur Admins behalten sie."""
     with get_connection() as conn:
-        conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (now, user_id))
-
-
-ONLINE_THRESHOLD_SECONDS = 5 * 60
-
-
-def is_user_online(last_seen: Optional[str]) -> bool:
-    if not last_seen:
-        return False
-    try:
-        seen_at = datetime.fromisoformat(last_seen)
-    except ValueError:
-        return False
-    now = datetime.now(timezone.utc) if seen_at.tzinfo else datetime.utcnow()
-    delta_s = (now - seen_at).total_seconds()
-    return 0 <= delta_s <= ONLINE_THRESHOLD_SECONDS
-
-
-def set_leaderboard_visible(user_id: int, visible: bool) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE users SET show_on_leaderboard = ? WHERE id = ?",
-            (1 if visible else 0, user_id),
+        cursor = conn.execute(
+            "UPDATE users SET is_approved = 0 WHERE is_admin = 0"
         )
-
-
-def get_pending_users() -> List[Dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY last_login DESC NULLS LAST"
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def set_own_profile(user_id: int, url: str, name: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE users SET own_profile_url = ?, own_profile_name = ? WHERE id = ?",
-            (url.strip(), name.strip(), user_id),
-        )
-
-
-def add_progress_snapshot(
-    user_id: int,
-    distinct_owned: int,
-    distinct_total: int,
-    total_copies: int,
-    missing_count: int,
-) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO progress_snapshots "
-            "(user_id, taken_at, distinct_owned, distinct_total, total_copies, missing_count) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, now, distinct_owned, distinct_total, total_copies, missing_count),
-        )
-
-
-def get_progress_history(user_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in reversed(rows)]
-
-
-def get_latest_progress(user_id: int) -> Optional[Dict[str, Any]]:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM progress_snapshots WHERE user_id = ? ORDER BY taken_at DESC LIMIT 1",
-            (user_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def get_leaderboard(limit: int = 50) -> List[Dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT u.id AS user_id, u.twitch_username, u.profile_image_url,
-                   p.taken_at, p.distinct_owned, p.distinct_total, p.total_copies, p.missing_count
-            FROM users u
-            JOIN progress_snapshots p ON p.id = (
-                SELECT id FROM progress_snapshots
-                WHERE user_id = u.id
-                ORDER BY taken_at DESC
-                LIMIT 1
-            )
-            WHERE u.is_banned = 0 AND u.show_on_leaderboard = 1
-            ORDER BY p.distinct_owned DESC, p.total_copies DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
-
-
-def create_session(twitch_id: str) -> str:
-    token = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
-    expires = now + timedelta(days=SESSION_TTL_DAYS)
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, twitch_id, now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds")),
-        )
-    return token
-
-
-def get_user_by_session_token(token: str) -> Optional[Dict[str, Any]]:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT twitch_id FROM sessions WHERE token = ? AND expires_at > ?",
-            (token, now),
-        ).fetchone()
-        if not row:
-            return None
-        user_row = conn.execute(
-            "SELECT * FROM users WHERE twitch_id = ?", (row["twitch_id"],)
-        ).fetchone()
-        return dict(user_row) if user_row else None
-
-
-def delete_session(token: str) -> None:
-    with get_connection() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-
-
-def delete_expired_sessions() -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
-
-
-def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO favorites (user_id, profile_url, profile_name, created_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
-            (user_id, profile_url.strip(), profile_name.strip(), now),
-        )
-
-
-def remove_favorite(user_id: int, profile_url: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?",
-            (user_id, profile_url.strip()),
-        )
-
-
-def is_favorite(user_id: int, profile_url: str) -> bool:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?",
-            (user_id, profile_url.strip()),
-        ).fetchone()
-        return row is not None
-
-
-def get_favorites(user_id: int) -> List[Dict[str, Any]]:
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM favorites WHERE user_id = ? ORDER BY profile_name COLLATE NOCASE",
-            (user_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        return cursor.rowcount
