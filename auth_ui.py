@@ -12,6 +12,36 @@ def render_user_management(current_user: dict) -> None:
         return
 
     users = db.get_all_users()
+def render_remove_approval_section():
+    """Admin-Sektion zum Entfernen von Freigaben."""
+    import streamlit as st
+    import db_3
+    
+    st.subheader("🗑️ Freigabe entziehen (Remove Approval)")
+    
+    approved_items = db_3.get_approved_items()
+    
+    if not approved_items:
+        st.info("Es sind aktuell keine freigegebenen Einträge vorhanden.")
+        return
+
+    selected_id = st.selectbox(
+        "Wähle den Datensatz aus, dessen Freigabe entfernt werden soll:",
+        options=[item["id"] for item in approved_items],
+        format_func=lambda x: next((item["name"] for item in approved_items if item["id"] == x), str(x)),
+        key="remove_approval_select"
+    )
+    
+    if st.button("❌ Freigabe aufheben", type="primary"):
+        success = db_3.remove_approval(selected_id)
+            
+        if success:
+            st.success(f"Die Freigabe für den Eintrag (ID: {selected_id}) wurde erfolgreich entfernt!")
+            st.rerun()
+        else:
+            st.error("Beim Entfernen der Freigabe ist ein Fehler aufgetreten.")
+
+    
 
     # Admin sieht alle 3 Tabs im Web-Dashboard, Supporter nur die ersten zwei
     if current_user.get("is_admin"):
