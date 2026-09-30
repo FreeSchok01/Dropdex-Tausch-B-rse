@@ -361,6 +361,7 @@ def render_admin_dashboard() -> None:
     st.markdown(ADMIN_CSS, unsafe_allow_html=True)
 
     st.markdown('<div class="section-title">🛠️ Moderations-Dashboard</div>', unsafe_allow_html=True)
+    st.caption("auth_ui · Widerruf-Version 2")
 
     # ---- Statistik-Zeile: wie viele Profile gibt es insgesamt und wie viele davon sind
     # GERADE (siehe db.ONLINE_THRESHOLD_SECONDS) online bzw. offline. ----
@@ -549,6 +550,13 @@ def render_admin_dashboard() -> None:
                         if st.button("↩️ Freigabe entziehen", key="admin_detail_revoke", use_container_width=True):
                             db.set_approved(selected["id"], False)
                             st.rerun()
+                    else:
+                        if selected["id"] == user["id"]:
+                            st.caption("↩️ Bei dir selbst kannst du die Freigabe nicht entziehen.")
+                        elif selected.get("is_admin"):
+                            st.caption("↩️ Bei Admins kann die Freigabe nicht entzogen werden. Erst „Admin entziehen“.")
+                        else:
+                            st.caption("↩️ Freigabe kann bei diesem Nutzer nicht entzogen werden (Rang).")
                     if _can_ban(user, selected):
                         if st.button("🚫 Bannen", key="admin_detail_ban", use_container_width=True):
                             db.set_banned(selected["id"], True)
