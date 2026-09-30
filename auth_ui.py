@@ -1,216 +1,308 @@
+# -*- coding: utf-8 -*-
+"""
+auth_ui.py
+==========
+Benutzeroberfläche für Twitch-Login, Nutzersessions, Berechtigungsprüfungen
+und das Moderations-Dashboard inkl. Massen-Freigabe-Entzug.
+"""
+
+import os
+import urllib.parse
+import requests
 import streamlit as st
+
 import db
 
+# Statische IDs für den Initial-Admin und Bootstrap-Supporter (optional über Umgebungsvariablen)
+BOOTSTRAP_ADMIN_TWITCH_IDS = [
+    x.strip() for x in os.getenv("BOOTSTRAP_ADMIN_TWITCH_IDS", "").split(",") if x.strip()
+]
+BOOTSTRAP_SUPPORTER_TWITCH_IDS = [
+    x.strip() for x in os.getenv("BOOTSTRAP_SUPPORTER_TWITCH_IDS", "").split(",") if x.strip()
+]
 
-def render_user_management(current_user: dict) -> None:
-    """Rendert die Benutzeroberfläche zur Rechte- und Freigabeverwaltung direkt im Dashboard."""
-    st.header("⚙️ Benutzerverwaltung & Moderation")
 
-    # Sicherheitsprüfung: Nur Admins oder Supporter dürfen diese Seite sehen
-    if not current_user.get("is_admin") and not current_user.get("is_supporter"):
-        st.error("❌ Zugriff verweigert. Du besitzt keine Berechtigung für dieses Menü.")
-        return
+def init_auth():
+    """Initialisiert die Datenbank-Tabellen beim Aufruf."""
+    db.init_db()
 
-    users = db.get_all_users()
-def render_remove_approval_section():
-    """Admin-Sektion zum Entfernen von Freigaben."""
-    import streamlit as st
-    import db_3
+
+def get_twitch_login_url() -> str:
+    """Generiert die Twitch OAuth Login URL."""
+    client_id = os.getenv("TWITCH_CLIENT_ID", "")
+    redirect_uri = os.getenv("TWITCH_REDIRECT_URI", "")
+    scope = "user:read:email"
     
-    st.subheader("🗑️ Freigabe entziehen (Remove Approval)")
-    
-    approved_items = db_3.get_approved_items()
-    
-    if not approved_items:
-        st.info("Es sind aktuell keine freigegebenen Einträge vorhanden.")
-        return
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": scope,
+    }
+    return f"https://id.twitch.tv/oauth2/authorize?{urllib.parse.urlencode(params)}"
 
-    selected_id = st.selectbox(
-        "Wähle den Datensatz aus, dessen Freigabe entfernt werden soll:",
-        options=[item["id"] for item in approved_items],
-        format_func=lambda x: next((item["name"] for item in approved_items if item["id"] == x), str(x)),
-        key="remove_approval_select"
+
+def handle_twitch_callback() -> bool:
+    """Verarbeitet den OAuth Code von Twitch nach der Weiterleitung."""
+    query_params = st.query_params
+    code = query_params.get("code")
+    
+    if not code:
+        return False
+
+    client_id = os.getenv("TWITCH_CLIENT_ID", "")
+    client_secret = os.getenv("TWITCH_CLIENT_SECRET", "")
+    redirect_uri = os.getenv("TWITCH_REDIRECT_URI", "")
+
+    # Token bei Twitch anfordern
+    token_url = "https://id.twitch.tv/oauth2/token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    }
+
+    try:
+        res = requests.post(token_url, data=data, timeout=10)
+        res_data = res.json()
+        access_token = res_data.get("access_token")
+
+        if not access_token:
+            st.error("Twitch-Authentifizierung fehlgeschlagen.")
+            return False
+
+        # Benutzerdaten von Twitch abrufen
+        headers = {
+            "Client-ID": client_id,
+            "Authorization": f"Bearer {access_token}",
+        }
+        user_res = requests.get("https://api.twitch.tv/helix/users", headers=headers, timeout=10)
+        user_data = user_res.json().get("data", [])[0]
+
+        twitch_id = str(user_data["id"])
+        twitch_username = user_data["display_name"]
+        profile_image_url = user_data.get("profile_image_url", "")
+
+        # User in DB anlegen oder laden
+        user = db.get_or_create_user(twitch_id, twitch_username, profile_image_url)
+
+        # Bootstrap-Rollen zuteilen falls konfiguriert
+        if twitch_id in BOOTSTRAP_ADMIN_TWITCH_IDS:
+            db.set_admin(user["id"], True)
+            db.set_approved(user["id"], True)
+            user = db.get_user_by_id(user["id"])
+
+        if twitch_id in BOOTSTRAP_SUPPORTER_TWITCH_IDS:
+            db.set_supporter(user["id"], True)
+
+        # Session-Token erstellen und speichern
+        session_token = db.create_session(twitch_id)
+        st.session_state["session_token"] = session_token
+        st.session_state["current_user"] = user
+
+        # Query Parameter bereinigen
+        st.query_params.clear()
+        return True
+
+    except Exception as e:
+        st.error(f"Fehler bei der Anmeldung: {e}")
+        return False
+
+
+def get_current_user():
+    """Gibt den aktuell eingeloggten Nutzer zurück oder None."""
+    if "current_user" in st.session_state and st.session_state["current_user"]:
+        user = db.get_user_by_id(st.session_state["current_user"]["id"])
+        st.session_state["current_user"] = user
+        if user:
+            db.touch_last_seen(user["id"])
+        return user
+
+    token = st.session_state.get("session_token")
+    if token:
+        user = db.get_user_by_session_token(token)
+        if user:
+            st.session_state["current_user"] = user
+            db.touch_last_seen(user["id"])
+            return user
+
+    return None
+
+
+def logout():
+    """Meldet den aktuellen Benutzer ab."""
+    token = st.session_state.get("session_token")
+    if token:
+        db.delete_session(token)
+    st.session_state.pop("session_token", None)
+    st.session_state.pop("current_user", None)
+    st.rerun()
+
+
+def render_login_button():
+    """Rendert den Twitch Login Button."""
+    url = get_twitch_login_url()
+    st.markdown(
+        f"""
+        <a href="{url}" target="_self" style="
+            display: inline-block;
+            background-color: #9146FF;
+            color: white;
+            padding: 10px 20px;
+            text-decoration: none;
+            font-weight: bold;
+            border-radius: 5px;
+        ">
+            🟣 Mit Twitch anmelden
+        </a>
+        """,
+        unsafe_allow_html=True,
     )
-    
-    if st.button("❌ Freigabe aufheben", type="primary"):
-        success = db_3.remove_approval(selected_id)
-            
-        if success:
-            st.success(f"Die Freigabe für den Eintrag (ID: {selected_id}) wurde erfolgreich entfernt!")
-            st.rerun()
-        else:
-            st.error("Beim Entfernen der Freigabe ist ein Fehler aufgetreten.")
 
-    
 
-    # Admin sieht alle 3 Tabs im Web-Dashboard, Supporter nur die ersten zwei
+def render_pending_approval_screen():
+    """Warteraum für Nutzer, die noch keine Freigabe haben."""
+    st.title("⏳ Account wartet auf Freigabe")
+    st.warning("Dein Account wurde registriert, muss aber noch von einem Moderator oder Admin freigeschaltet werden.")
+    st.info("Bitte gedulde dich einen Moment. Sobald du freigeschaltet wurdest, kannst du die Anwendung nutzen.")
+    if st.button("Logout / Abmelden"):
+        logout()
+
+
+def render_banned_screen():
+    """Sperrbildschirm für gesperrte Nutzer."""
+    st.title("🚫 Account gesperrt")
+    st.error("Dein Account wurde gesperrt. Du hast keinen Zugriff mehr auf diese Anwendung.")
+    if st.button("Logout / Abmelden"):
+        logout()
+
+
+def render_moderation_dashboard(current_user: dict):
+    """Vollständiges Moderations- und Admin-Dashboard."""
+    if not (current_user.get("is_admin") or current_user.get("is_supporter")):
+        st.error("Du hast keine Berechtigung für das Moderations-Dashboard.")
+        return
+
+    st.title("🛡️ Moderation & Verwaltung")
+
+    tabs = ["⏳ Offene Freigaben", "👥 Benutzerverwaltung"]
     if current_user.get("is_admin"):
-        tabs = ["⏳ Warten auf Freigabe", "👥 Alle Benutzer verwalten", "🚨 Massen-Aktionen & Sicherheit"]
-    else:
-        tabs = ["⏳ Warten auf Freigabe", "👥 Alle Benutzer verwalten"]
+        tabs.append("🚨 Massen-Aktionen & Sicherheit")
 
     tab_objects = st.tabs(tabs)
 
-    # -------------------------------------------------------------------
-    # TAB 1: Ausstehende Freigaben
-    # -------------------------------------------------------------------
+    # TAB 1: Offene Freigaben
     with tab_objects[0]:
-        st.subheader("Ausstehende Account-Freigaben")
-        pending_users = [u for u in users if not bool(u.get("is_approved"))]
+        st.subheader("Ausstehende Nutzer-Freigaben")
+        pending = db.get_pending_users()
 
-        if not pending_users:
-            st.info("Aktuell warten keine Benutzer auf eine Freigabe.")
+        if not pending:
+            st.success("Aktuell warten keine neuen Nutzer auf eine Freigabe.")
         else:
-            st.write(f"Es warten **{len(pending_users)}** Benutzer auf Aktivierung:")
-            
-            for u in pending_users:
-                c1, c2, c3, c4 = st.columns([1, 3, 3, 2])
-                with c1:
-                    if u.get("profile_image_url"):
-                        st.image(u["profile_image_url"], width=40)
-                    else:
-                        st.write("👤")
-                with c2:
-                    st.write(f"**{u['twitch_username']}**")
-                with c3:
-                    st.write(f"ID: `{u['twitch_id']}`")
-                with c4:
-                    if st.button("✅ Jetzt Freigeben", key=f"app_pend_{u['id']}", type="primary"):
-                        db.toggle_user_approval(u["id"], True)
-                        st.success(f"{u['twitch_username']} freigegeben!")
+            for u in pending:
+                col_info, col_btn1, col_btn2 = st.columns([3, 1, 1])
+                with col_info:
+                    st.write(f"**{u['twitch_username']}** (ID: `{u['twitch_id']}`)")
+                    st.caption(f"Registriert/Letzter Login: {u['last_login'] or 'Unbekannt'}")
+                with col_btn1:
+                    if st.button("✅ Freigeben", key=f"approve_{u['id']}", type="primary"):
+                        db.set_approved(u['id'], True)
+                        st.success(f"{u['twitch_username']} wurde freigegeben.")
+                        st.rerun()
+                with col_btn2:
+                    if st.button("🚫 Sperren", key=f"ban_pending_{u['id']}"):
+                        db.set_banned(u['id'], True)
+                        st.warning(f"{u['twitch_username']} wurde gesperrt.")
                         st.rerun()
                 st.divider()
 
-    # -------------------------------------------------------------------
-    # TAB 2: Übersicht aller Benutzer mit allen Buttons
-    # -------------------------------------------------------------------
+    # TAB 2: Benutzerverwaltung
     with tab_objects[1]:
-        st.subheader("Direkt-Verwaltung aller Konten")
+        st.subheader("Alle registrierten Benutzer")
+        all_users = db.get_all_users()
 
-        if not users:
-            st.info("Keine Benutzer in der Datenbank gefunden.")
-        else:
-            # Tabellen-Kopfzeile
-            head_col1, head_col2, head_col3, head_col4 = st.columns([2, 2, 3, 3])
-            with head_col1:
-                st.markdown("**Benutzer**")
-            with head_col2:
-                st.markdown("**Rolle & Status**")
-            with head_col3:
-                st.markdown("**Freigabe-Aktion**")
-            with head_col4:
-                st.markdown("**Supporter-Aktion**")
+        search = st.text_input("🔍 Benutzer suchen", placeholder="Twitch-Name...").strip().lower()
+        if search:
+            all_users = [u for u in all_users if search in u["twitch_username"].lower()]
+
+        for u in all_users:
+            col_avatar, col_details, col_actions = st.columns([1, 4, 3])
+
+            with col_avatar:
+                if u.get("profile_image_url"):
+                    st.image(u["profile_image_url"], width=50)
+                else:
+                    st.write("👤")
+
+            with col_details:
+                st.write(f"**{u['twitch_username']}** (ID: {u['id']})")
+                
+                badges = []
+                if u["is_admin"]:
+                    badges.append("🔴 Admin")
+                if u["is_supporter"]:
+                    badges.append("🟢 Supporter")
+                if u["is_approved"]:
+                    badges.append("✅ Freigegeben")
+                else:
+                    badges.append("⏳ Wartet auf Freigabe")
+                if u["is_banned"]:
+                    badges.append("🚫 Gesperrt")
+                st.caption(" | ".join(badges))
+
+            with col_actions:
+                if not u["is_admin"] or current_user.get("is_admin"):
+                    # Hier befindet sich der Button zum Entziehen der Freigabe:
+                    if u["is_approved"]:
+                        if st.button("❌ Freigabe entziehen", key=f"revoke_app_{u['id']}"):
+                            db.set_approved(u['id'], False)
+                            st.rerun()
+                    else:
+                        if st.button("✅ Freigeben", key=f"grant_app_{u['id']}"):
+                            db.set_approved(u['id'], True)
+                            st.rerun()
+
+                    if current_user.get("is_admin"):
+                        is_supp = bool(u["is_supporter"])
+                        new_supp = st.checkbox("Supporter", value=is_supp, key=f"chk_supp_{u['id']}")
+                        if new_supp != is_supp:
+                            db.set_supporter(u['id'], new_supp)
+                            st.rerun()
+
+                        is_adm = bool(u["is_admin"])
+                        new_adm = st.checkbox("Admin", value=is_adm, key=f"chk_adm_{u['id']}")
+                        if new_adm != is_adm:
+                            db.set_admin(u['id'], new_adm)
+                            st.rerun()
+
+                    if u["is_banned"]:
+                        if st.button("Entsperren", key=f"unban_{u['id']}"):
+                            db.set_banned(u['id'], False)
+                            st.rerun()
+                    else:
+                        if st.button("🚫 Sperren", key=f"ban_{u['id']}"):
+                            db.set_banned(u['id'], True)
+                            st.rerun()
+
             st.divider()
 
-            for u in users:
-                is_approved = bool(u.get("is_approved"))
-                is_supporter = bool(u.get("is_supporter"))
-                is_admin = bool(u.get("is_admin"))
-
-                c1, c2, c3, c4 = st.columns([2, 2, 3, 3])
-
-                # Spalte 1: Name & Bild
-                with c1:
-                    st.write(f"**{u['twitch_username']}**")
-                    st.caption(f"ID: {u['twitch_id']}")
-
-                # Spalte 2: Rollen-Badges
-                with c2:
-                    if is_admin:
-                        st.markdown("🔴 **Admin**")
-                    elif is_supporter:
-                        st.markdown("⭐ **Supporter**")
-                    else:
-                        st.markdown("👤 **Normaler User**")
-
-                    if is_approved:
-                        st.caption("🟢 Freigegeben")
-                    else:
-                        st.caption("🔴 Gesperrt")
-
-                # Spalte 3: FREIGABE ENTZIEHEN / ERTEILEN BUTTON
-                with c3:
-                    is_self_admin = is_admin and (u["id"] == current_user["id"])
-
-                    if is_approved:
-                        if st.button(
-                            "🚫 Freigabe entziehen",
-                            key=f"btn_revoke_{u['id']}",
-                            type="secondary",
-                            disabled=is_self_admin,
-                        ):
-                            db.toggle_user_approval(u["id"], False)
-                            st.warning(f"Freigabe für {u['twitch_username']} wurde entzogen!")
-                            st.rerun()
-                    else:
-                        if st.button(
-                            "✅ Freigeben",
-                            key=f"btn_approve_{u['id']}",
-                            type="primary",
-                        ):
-                            db.toggle_user_approval(u["id"], True)
-                            st.success(f"{u['twitch_username']} wurde freigegeben!")
-                            st.rerun()
-
-                # Spalte 4: SUPPORTER BERECHTIGUNG ÄNDERN
-                with c4:
-                    if current_user.get("is_admin"):
-                        if is_admin:
-                            st.caption("Admins unantastbar")
-                        elif is_supporter:
-                            if st.button(
-                                "⬇️ Supporter entfernen",
-                                key=f"btn_rem_sup_{u['id']}",
-                            ):
-                                db.toggle_user_supporter(u["id"], False)
-                                st.rerun()
-                        else:
-                            if st.button(
-                                "⭐ Zum Supporter machen",
-                                key=f"btn_add_sup_{u['id']}",
-                            ):
-                                db.toggle_user_supporter(u["id"], True)
-                                st.rerun()
-
-                st.divider()
-
-    # -------------------------------------------------------------------
     # TAB 3: Massen-Aktionen (Nur Admins)
-    # -------------------------------------------------------------------
     if current_user.get("is_admin") and len(tab_objects) > 2:
         with tab_objects[2]:
             st.subheader("🚨 Massen-Aktionen & Zurücksetzen")
-
-            # 1. Nur normale User sperren
-            st.markdown("### 1. Freigabe nur von normalen Usern entziehen")
-            st.info("Entzieht allen normalen Benutzern die Freigabe. **Admins und Supporter behalten ihre Freigabe.**")
-            confirm_user_revoke = st.checkbox(
-                "Ich bestätige, dass ich allen normalen Usern die Freigabe entziehen möchte.",
-                key="confirm_user_revoke",
+            st.warning(
+                "Achtung: Die folgende Aktion entzieht **allen** Benutzern und Supportern auf einmal die Freigabe. "
+                "Ausgenommen sind lediglich Admins. Alle betroffenen Nutzer müssen anschließend neu freigegeben werden."
             )
-            if st.button(
-                "❌ Freigabe aller normalen User entziehen",
-                type="secondary",
-                disabled=not confirm_user_revoke,
-            ):
-                count = db.revoke_all_approvals_except_admins_and_supporters()
-                st.success(f"Erfolgreich! Bei {count} normalen User-Accounts wurde die Freigabe entzogen.")
-                st.rerun()
 
-            st.divider()
-
-            # 2. Alle sperren (inkl. Supporter)
-            st.markdown("### 2. Freigabe von ALLEN entziehen (inkl. Supporter)")
-            st.warning("Achtung: Diese Aktion entzieht **allen** Benutzern und Supportern auf einmal die Freigabe.")
-            confirm_mass_revoke = st.checkbox(
+            confirm = st.checkbox(
                 "Ich bestätige, dass ich allen Usern und Supportern die Freigabe entziehen möchte.",
                 key="confirm_mass_revoke",
             )
-            if st.button(
-                "💥 JETZT ALLE FREIGABEN ENTZIEHEN (inkl. Supporter)",
-                type="primary",
-                disabled=not confirm_mass_revoke,
-            ):
+
+            if st.button("💥 JETZT ALLE FREIGABEN ENTZIEHEN", type="primary", disabled=not confirm):
                 count = db.revoke_all_approvals_except_admins()
                 st.success(f"Erfolgreich! Bei {count} Accounts wurde die Freigabe entzogen.")
                 st.rerun()
