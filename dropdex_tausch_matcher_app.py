@@ -4777,11 +4777,60 @@ def render_trade_tab(name_map: Dict[str, str], selected_rarities: List[str], use
     )
 
 
+def render_revoke_approvals_panel(user: Dict[str, Any]) -> None:
+    """Freigaben widerrufen. Admins: bei Supportern und Zuschauern. Supporter: nur bei Zuschauern.
+    Nie bei sich selbst, nie bei Admins, gesperrte Nutzer werden ausgelassen."""
+    is_admin = bool(user.get("is_admin"))
+    if not (is_admin or user.get("is_supporter")):
+        return
+
+    def _allowed(u: Dict[str, Any]) -> bool:
+        if u["id"] == user["id"] or u.get("is_admin") or u.get("is_banned"):
+            return False
+        if not u.get("is_approved"):
+            return False
+        return is_admin or not u.get("is_supporter")
+
+    st.markdown("### ↩️ Freigaben widerrufen")
+    candidates = [u for u in db.get_all_users() if _allowed(u)]
+
+    needle = st.text_input(
+        "🔍 Nutzer suchen", placeholder="Twitch-Name...", key="revoke_search"
+    ).strip().lower()
+    if needle:
+        candidates = [u for u in candidates if needle in u["twitch_username"].lower()]
+
+    if not candidates:
+        st.info("Keine freigegebenen Nutzer gefunden, bei denen du die Freigabe entziehen kannst.")
+        return
+
+    names = {u["id"]: u["twitch_username"] + (" 🧡" if u.get("is_supporter") else "") for u in candidates}
+    selected = st.multiselect(
+        "Nutzer auswählen",
+        options=list(names.keys()),
+        format_func=lambda uid: names[uid],
+        key="revoke_selection",
+    )
+    if st.button(
+        f"↩️ Freigabe für {len(selected)} Nutzer entziehen",
+        type="primary",
+        disabled=not selected,
+        key="revoke_btn",
+    ):
+        allowed_ids = {u["id"] for u in candidates}
+        for uid in selected:
+            if uid in allowed_ids:
+                db.set_approved(uid, False)
+        st.success(f"Bei {len(selected)} Nutzer(n) wurde die Freigabe entzogen.")
+        st.rerun()
+
+
 def render_admin_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None:
     """Bereich „🛠️ Admin“: Nutzerverwaltung (Sperren/Admin) + öffentliche Profilliste verwalten
     (inkl. Löschen). Wird in main() nur als Reiter angeboten, wenn der eingeloggte Nutzer
     Admin ist (siehe render_sidebar_nav())."""
     auth_ui.render_admin_dashboard()
+    render_revoke_approvals_panel(user)
     render_admin_panel(name_map, user)
 
 
@@ -4796,6 +4845,7 @@ def render_supporter_tab(name_map: Dict[str, str], user: Dict[str, Any]) -> None
     is_supporter eindeutig feststeht. Supporter dürfen Profile hinzufügen, aber nicht löschen
     - siehe render_admin_panel()."""
     auth_ui.render_admin_dashboard()
+    render_revoke_approvals_panel(user)
     render_admin_panel(name_map, user, require_password=False, as_expander=False)
 
 
