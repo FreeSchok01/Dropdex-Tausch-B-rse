@@ -1,111 +1,91 @@
 # -*- coding: utf-8 -*-
 """
-wishlist.py
-===========
-Eigenständiges Mini-Modul für das öffentliche "📋 Ich suche"-Board: jeder Account kann
-Karten, die ihm fehlen, auf eine öffentlich sichtbare Wunschliste setzen. Andere Nutzer
-sehen das Board, statt aktiv nach "Wer hat Karte X" suchen zu müssen, und können den
-Wunschgeber direkt über den bestehenden Chat (siehe chat.py) anschreiben.
+wishlist.py  (Firestore-Version)
+================================
+Öffentliches "📋 Ich suche"-Board: jeder Account kann Karten, die ihm fehlen, auf eine
+öffentlich sichtbare Wunschliste setzen. Andere Nutzer sehen das Board und können den
+Wunschgeber direkt über den Chat (siehe chat.py) anschreiben.
 
-Eigene, kleine SQLite-Datei - unabhängig von db.py, damit hier nichts am bestehenden
-Datenbank-Schema geändert werden muss (gleiches Muster wie chat.py/trade_watch.py).
+Firestore: Sammlung wishes/{user_id}_{hash(card_id)}  (ersetzt den UNIQUE-Constraint:
+pro Nutzer und Karte gibt es genau ein Dokument). Die "id" nach außen ist die Dokument-ID
+(ein String) und wird von der Haupt-App nur durchgereicht (remove_wish(user_id, w["id"])).
 
-Anzeigenamen/Avatare der Nutzer werden bewusst NICHT hier gespeichert (könnten veralten),
-sondern von der aufrufenden Seite jeweils frisch per db.get_user_by_id() nachgeschlagen.
+Anzeigenamen/Avatare werden bewusst NICHT hier gespeichert, sondern von der aufrufenden
+Seite per db.get_user_by_id() frisch nachgeschlagen.
 """
 
-import os
-import sqlite3
-from datetime import datetime
+import hashlib
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wishlist.db")
+import fb
+
+_cache = fb.TTLCache(ttl=15.0)
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _col():
+    return fb.get_client().collection("wishes")
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+def _doc_id(user_id: int, card_id: str) -> str:
+    return f"{int(user_id)}_{hashlib.sha1(str(card_id).encode('utf-8')).hexdigest()[:20]}"
+
+
+def _sorted_newest_first(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(rows, key=lambda r: r.get("ts") or r.get("created_at") or "", reverse=True)
 
 
 def init_db() -> None:
-    """Legt die Tabelle an, falls sie noch nicht existiert. Mehrfacher Aufruf ist unkritisch."""
-    with _connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS wishes (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id     INTEGER NOT NULL,
-                card_id     TEXT NOT NULL,
-                card_name   TEXT NOT NULL,
-                rarity      TEXT,
-                note        TEXT,
-                created_at  TEXT NOT NULL,
-                UNIQUE (user_id, card_id)
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_wishes_user ON wishes (user_id)")
-        _ensure_column(conn, "wishes", "image_url", "TEXT DEFAULT ''")
-        conn.commit()
+    """Bleibt aus Kompatibilitätsgründen erhalten - Firestore braucht kein Schema."""
+    fb.get_client()
 
 
 def add_wish(user_id: int, card_id: str, card_name: str, rarity: str = "", note: str = "",
              image_url: str = "") -> None:
-    """Setzt eine Karte auf die eigene Wunschliste. Steht die Karte schon drauf, wird nur
-    die Notiz aktualisiert (kein doppelter Eintrag, siehe UNIQUE-Constraint)."""
+    """Setzt eine Karte auf die eigene Wunschliste. Steht die Karte schon drauf, werden nur
+    Notiz und Bild aktualisiert (kein doppelter Eintrag)."""
     if not card_id or not card_name:
         return
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO wishes (user_id, card_id, card_name, rarity, note, created_at, image_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(user_id, card_id) DO UPDATE SET note = excluded.note, "
-            "image_url = excluded.image_url",
-            (user_id, card_id, card_name, rarity, note.strip(),
-             datetime.now().isoformat(timespec="seconds"), image_url or ""),
-        )
-        conn.commit()
+    ref = _col().document(_doc_id(user_id, card_id))
+    if ref.get().exists:
+        ref.update({"note": note.strip(), "image_url": image_url or ""})
+    else:
+        ref.set({
+            "id": ref.id, "user_id": int(user_id), "card_id": str(card_id), "card_name": card_name,
+            "rarity": rarity, "note": note.strip(), "image_url": image_url or "",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+        })
+    _cache.clear()
 
 
-def remove_wish(user_id: int, wish_id: int) -> None:
+def remove_wish(user_id: int, wish_id: Any) -> None:
     """Entfernt einen Wunsch - nur der Ersteller selbst darf das (user_id wird mitgeprüft)."""
-    with _connect() as conn:
-        conn.execute("DELETE FROM wishes WHERE id = ? AND user_id = ?", (wish_id, user_id))
-        conn.commit()
+    ref = _col().document(str(wish_id))
+    snap = ref.get()
+    if snap.exists and int(snap.to_dict().get("user_id", -1)) == int(user_id):
+        ref.delete()
+        _cache.clear()
 
 
 def get_my_wishes(user_id: int) -> List[Dict[str, Any]]:
     """Eigene Wunschliste, neueste zuerst."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM wishes WHERE user_id = ? ORDER BY id DESC", (user_id,)
-        ).fetchall()
-        return [dict(r) for r in rows]
+    def load():
+        return _sorted_newest_first(
+            [dict(d.to_dict(), id=d.id) for d in _col().where("user_id", "==", int(user_id)).stream()])
+    return list(_cache.get(("mine", int(user_id)), load))
 
 
 def get_board(exclude_user_id: Optional[int] = None, limit: int = 500) -> List[Dict[str, Any]]:
-    """Das komplette öffentliche Board (alle Wünsche aller Nutzer), neueste zuerst. Der
-    eigene Nutzer kann ausgeschlossen werden, da man sich selbst nicht anschreiben kann."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM wishes ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    items = [dict(r) for r in rows]
+    """Das komplette öffentliche Board (alle Wünsche aller Nutzer), neueste zuerst. Der eigene
+    Nutzer kann ausgeschlossen werden, da man sich selbst nicht anschreiben kann."""
+    def load():
+        return _sorted_newest_first([dict(d.to_dict(), id=d.id) for d in _col().stream()])
+    items = list(_cache.get(("board",), load))[:limit]
     if exclude_user_id is not None:
-        items = [i for i in items if i["user_id"] != exclude_user_id]
+        items = [i for i in items if int(i["user_id"]) != int(exclude_user_id)]
     return items
 
 
 def already_wished(user_id: int, card_id: str) -> bool:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM wishes WHERE user_id = ? AND card_id = ?", (user_id, card_id)
-        ).fetchone()
-        return row is not None
+    return _col().document(_doc_id(user_id, card_id)).get().exists
