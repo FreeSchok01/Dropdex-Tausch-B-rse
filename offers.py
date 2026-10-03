@@ -25,7 +25,13 @@ from typing import Any, Dict, List, Optional
 
 import fb
 
-_cache = fb.TTLCache(ttl=15.0)
+# Das komplette Board liegt per Live-Listener im Speicher (fb.watched_query): Abfragen kosten
+# nichts, die Daten sind trotzdem immer aktuell. Eigene Änderungen werden sofort eingetragen.
+_KEY = "offers"
+
+
+def _all() -> List[Dict[str, Any]]:
+    return [dict(d, id=doc_id) for doc_id, d in fb.watched_query(_KEY, _col)]
 
 
 def _col():
@@ -61,62 +67,59 @@ def add_offer(user_id: int, card_id: str, card_name: str, rarity: str = "", note
     if not card_id or not card_name:
         return
     ref = _col().document(_doc_id(user_id, card_id))
-    if ref.get().exists:
-        ref.update({"note": note.strip(), "image_url": image_url or "", "rarity": rarity})
-        _cache.clear()
+    if already_offered(user_id, card_id):
+        fields = {"note": note.strip(), "image_url": image_url or "", "rarity": rarity}
+        ref.update(fields)
+        fb.wq_patch(_KEY, ref.id, fields, merge=True)
         return
-    ref.set({
+    data = {
         "id": ref.id, "user_id": int(user_id), "card_id": str(card_id), "card_name": card_name,
         "rarity": rarity, "note": note.strip(), "image_url": image_url or "",
         "auto": 1 if auto else 0,
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-    })
-    _cache.clear()
+    }
+    ref.set(data)
+    fb.wq_patch(_KEY, ref.id, data)
     _check_matches(user_id)
 
 
 def remove_offer(user_id: int, offer_id: Any) -> None:
     """Entfernt ein Angebot - nur der Ersteller selbst darf das (user_id wird mitgeprüft)."""
-    ref = _col().document(str(offer_id))
-    snap = ref.get()
-    if snap.exists and int(snap.to_dict().get("user_id", -1)) == int(user_id):
-        ref.delete()
-        _cache.clear()
+    doc = next((r for r in _all() if r["id"] == str(offer_id)), None)
+    if doc and int(doc.get("user_id", -1)) == int(user_id):
+        _col().document(str(offer_id)).delete()
+        fb.wq_patch(_KEY, str(offer_id), None)
         _check_matches(user_id)
 
 
 def remove_auto_offer(user_id: int, card_id: str) -> None:
     """Entfernt einen automatisch von trade_watch gesetzten Eintrag wieder. Manuelle Einträge
     (auto=0) bleiben unberührt, selbst wenn sie dieselbe Karte betreffen."""
-    ref = _col().document(_doc_id(user_id, card_id))
-    snap = ref.get()
-    if snap.exists and int(snap.to_dict().get("auto", 0)) == 1:
-        ref.delete()
-        _cache.clear()
+    did = _doc_id(user_id, card_id)
+    doc = next((r for r in _all() if r["id"] == did), None)
+    if doc and int(doc.get("auto", 0)) == 1:
+        _col().document(did).delete()
+        fb.wq_patch(_KEY, did, None)
         _check_matches(user_id)
 
 
 def get_my_offers(user_id: int) -> List[Dict[str, Any]]:
     """Eigene Angebotsliste, neueste zuerst."""
-    def load():
-        return _sorted_newest_first(
-            [dict(d.to_dict(), id=d.id) for d in _col().where("user_id", "==", int(user_id)).stream()])
-    return list(_cache.get(("mine", int(user_id)), load))
+    return _sorted_newest_first([r for r in _all() if int(r.get("user_id", -1)) == int(user_id)])
 
 
 def get_board(exclude_user_id: Optional[int] = None, limit: int = 500) -> List[Dict[str, Any]]:
     """Das komplette öffentliche Board (alle Angebote aller Nutzer), neueste zuerst."""
-    def load():
-        return _sorted_newest_first([dict(d.to_dict(), id=d.id) for d in _col().stream()])
-    items = list(_cache.get(("board",), load))[:limit]
+    items = _sorted_newest_first(_all())[:limit]
     if exclude_user_id is not None:
         items = [i for i in items if int(i["user_id"]) != int(exclude_user_id)]
     return items
 
 
 def already_offered(user_id: int, card_id: str) -> bool:
-    return _col().document(_doc_id(user_id, card_id)).get().exists
+    did = _doc_id(user_id, card_id)
+    return any(r["id"] == did for r in _all())
 
 
 # ---------------------------------------------------------------------------
