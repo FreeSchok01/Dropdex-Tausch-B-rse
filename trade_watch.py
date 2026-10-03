@@ -47,6 +47,10 @@ MATCH_WINDOW_SECONDS = 600
 
 _last_check: Dict[int, float] = {}
 
+# Letzter bekannter Stand je Nutzer im Speicher (None = noch nie synchronisiert). Der Check läuft
+# alle paar Sekunden - ohne diesen Cache wäre jeder Check ein Firestore-Lesezugriff.
+_cards_cache: Dict[int, Optional[Dict[str, Any]]] = {}
+
 
 def _fs():
     return fb.get_client()
@@ -77,14 +81,17 @@ def _touch(user_id: int) -> None:
 def _load_cards(user_id: int) -> Optional[Dict[str, Any]]:
     """Gespeicherter Stand {key: {i,n,r,c}} oder None, wenn für den Nutzer noch nie ein
     Snapshot gespeichert wurde (dann ist der nächste Sync der "erste" und meldet nichts)."""
-    snap = _snap_ref(user_id).get()
-    if not snap.exists:
-        return None
-    return (snap.to_dict() or {}).get("cards", {})
+    uid = int(user_id)
+    if uid in _cards_cache:
+        return _cards_cache[uid]
+    snap = _snap_ref(uid).get()
+    cards = (snap.to_dict() or {}).get("cards", {}) if snap.exists else None
+    _cards_cache[uid] = cards
+    return cards
 
 
 def _has_synced_before(user_id: int) -> bool:
-    return _snap_ref(user_id).get().exists
+    return _load_cards(user_id) is not None
 
 
 def _format_new_card_message(card_name: str, cur_count: int, partner_name: Optional[str] = None) -> str:
@@ -199,6 +206,7 @@ def sync_inventory(user_id: int, inventory: List[Dict[str, Any]], is_first_sync:
     if dirty or not prev_cards:
         _snap_ref(user_id).set({"cards": cards,
                                 "updated_at": datetime.now().isoformat(timespec="seconds")})
+        _cards_cache[int(user_id)] = cards
 
     for cid, name, rarity, direction, cur_count, prev_count in pending_events:
         _record_event(user_id, cid, name, rarity, direction, cur_count, prev_count)
