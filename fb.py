@@ -27,6 +27,8 @@ def _load_credentials_dict() -> Optional[Dict[str, Any]]:
     # 1) Streamlit-Secrets (nur wenn Streamlit vorhanden und der Block gesetzt ist)
     try:
         import streamlit as st
+        if "firebase_json" in st.secrets:  # kompletter Inhalt der JSON-Datei als Text
+            return json.loads(st.secrets["firebase_json"])
         if "firebase" in st.secrets:
             return dict(st.secrets["firebase"])
     except Exception:  # noqa: BLE001
@@ -58,6 +60,21 @@ def _normalize_private_key(key: str) -> str:
     return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----\n"
 
 
+def _key_diagnosis(key: Any) -> str:
+    """Kurze Beschreibung des Schlüssels OHNE dessen Inhalt - hilft, den Fehler einzugrenzen."""
+    import re
+    if not isinstance(key, str):
+        return "private_key fehlt oder ist kein Text."
+    m = re.search(r"-----BEGIN PRIVATE KEY-----(.*?)-----END PRIVATE KEY-----", key, re.S)
+    if not m:
+        return (f"Kopf/Fuß fehlen (Länge {len(key)}). Beginnt mit BEGIN: "
+                f"{key.strip().startswith('-----BEGIN PRIVATE KEY-----')}, "
+                f"endet mit END: {key.strip().endswith('-----END PRIVATE KEY-----')}.")
+    body = re.sub(r"[^A-Za-z0-9+/=]", "", m.group(1))
+    return (f"Schlüsselkörper {len(body)} Zeichen (ein gültiger 2048-Bit-Schlüssel hat meist "
+            f"ca. 1624), Rest mod 4 = {len(body) % 4} (muss 0 sein).")
+
+
 def get_client():
     """Gibt den (einmalig erzeugten) Firestore-Client zurück."""
     global _client
@@ -76,9 +93,8 @@ def get_client():
             firebase_admin.initialize_app(credentials.Certificate(data))
         except ValueError as exc:
             raise RuntimeError(
-                "Der Firebase-private_key ist beschädigt (vermutlich beim Einfügen in die Secrets "
-                "abgeschnitten oder verändert). Erzeuge einen neuen Schlüssel und trage ihn "
-                "mit dem Umwandlungs-Befehl aus der Anleitung ein."
+                "Der Firebase-private_key ist beschädigt. Diagnose (ohne Schlüsselinhalt): "
+                + _key_diagnosis(data.get("private_key"))
             ) from exc
     _client = firestore.client()
     return _client
