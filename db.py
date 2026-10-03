@@ -1,46 +1,55 @@
 # -*- coding: utf-8 -*-
 """
-db.py
-=====
-Nutzer-Datenbank (SQLite) für die Dropdex-Tauschbörse:
+db.py  (Firestore-Version)
+==========================
+Nutzer-Datenbank für die Dropdex-Tauschbörse - gleiche Funktionen wie die frühere
+SQLite-Version, speichert aber in Firebase Firestore (siehe fb.py).
 
-  - users               Twitch-Accounts inkl. Rollen/Status (Admin, Supporter, freigegeben, gesperrt),
-                        eigenem Dropdex-Profil, Online-Status (last_seen) und Bestenlisten-Opt-in
-  - sessions            "Eingeloggt bleiben" per Token in der URL (siehe auth_ui.py)
-  - favorites           Favoriten-Profile je Account
-  - progress_snapshots  Fortschrittsverlauf je Account (Verlaufsdiagramm + Bestenliste)
+Firestore-Struktur:
+  users/{id}                    Account (id bleibt eine Zahl, damit chat.py, offers.py usw.
+                                unverändert weiterarbeiten; Dokument-ID = str(id))
+    users/{id}/favorites/{hash} Favoriten-Profile
+    users/{id}/snapshots/{auto} Fortschrittsverlauf
+  twitch_index/{twitch_id}      -> {id}   schneller Lookup Twitch-ID -> interne ID
+  sessions/{token}              "Eingeloggt bleiben" (expires_at, siehe delete_expired_sessions)
+  meta/counters                 {users: <letzte vergebene ID>}
 
-Alle Zeitstempel werden als UTC-ISO-Strings gespeichert (siehe is_user_online() und
-online_status_html() in der Haupt-App, die davon ausgehen).
-
-Die Datei dropdex_users.db liegt neben dieser Datei und ist in .gitignore eingetragen.
-Spalten, die in einer älteren Version der DB fehlen, werden in init_db() automatisch
-nachgerüstet (_ensure_column), damit bestehende Datenbanken weiter funktionieren.
+Alle Zeitstempel bleiben UTC-ISO-Strings (is_user_online() & Co. in der Haupt-App erwarten das).
 """
 
-import os
+import hashlib
 import secrets
-import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dropdex_users.db")
+from google.cloud import firestore
 
-# Innerhalb dieser Zeitspanne seit dem letzten Seitenaufruf gilt ein Account als "online".
+import fb
+
 ONLINE_THRESHOLD_SECONDS = 300
-
-# So lange bleibt ein Login-Token (?session=...) gültig.
 SESSION_LIFETIME_DAYS = 30
+
+# last_seen höchstens alle X Sekunden schreiben (spart Firestore-Schreibzugriffe, da die
+# App touch_last_seen() bei jedem Rerun aufruft; ONLINE_THRESHOLD ist deutlich größer).
+_TOUCH_MIN_INTERVAL = 60
+_last_touch: Dict[int, float] = {}
+
+# Kleiner In-Prozess-Cache für die Namenssuche (spart Lesezugriffe beim Tippen).
+_SEARCH_CACHE_TTL = 30
+_search_cache: Dict[str, Any] = {"ts": 0.0, "users": []}
 
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _fs():
+    return fb.get_client()
+
+
+def _users():
+    return _fs().collection("users")
 
 
 def _utc_now() -> datetime:
@@ -51,101 +60,25 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat(timespec="seconds")
 
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
-    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-
-
-def _row_to_user(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    if row is None:
+def _doc_to_user(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if d is None:
         return None
-    u = dict(row)
-    for key in ("is_admin", "is_supporter", "is_approved", "is_banned", "show_on_leaderboard"):
-        u[key] = bool(u.get(key))
+    u = dict(d)
+    for key in ("is_admin", "is_supporter", "is_approved", "is_banned"):
+        u[key] = bool(u.get(key, False))
+    u["show_on_leaderboard"] = bool(u.get("show_on_leaderboard", True))
     u["own_profile_url"] = u.get("own_profile_url") or ""
     u["own_profile_name"] = u.get("own_profile_name") or ""
     u["profile_image_url"] = u.get("profile_image_url") or ""
+    u.setdefault("last_seen", None)
+    u.pop("latest_snapshot", None)
     return u
 
 
-# ---------------------------------------------------------------------------
-# Schema
-# ---------------------------------------------------------------------------
-
 def init_db() -> None:
-    """Legt alle Tabellen an (falls nötig) und rüstet fehlende Spalten nach.
-    Mehrfacher Aufruf ist unkritisch."""
-    with _connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                twitch_id           TEXT NOT NULL UNIQUE,
-                twitch_username     TEXT NOT NULL,
-                profile_image_url   TEXT DEFAULT '',
-                is_admin            INTEGER NOT NULL DEFAULT 0,
-                is_supporter        INTEGER NOT NULL DEFAULT 0,
-                is_approved         INTEGER NOT NULL DEFAULT 0,
-                is_banned           INTEGER NOT NULL DEFAULT 0,
-                own_profile_url     TEXT DEFAULT '',
-                own_profile_name    TEXT DEFAULT '',
-                show_on_leaderboard INTEGER NOT NULL DEFAULT 1,
-                last_seen           TEXT,
-                created_at          TEXT NOT NULL
-            )
-            """
-        )
-        # Nachrüsten für ältere DB-Versionen
-        _ensure_column(conn, "users", "profile_image_url", "TEXT DEFAULT ''")
-        _ensure_column(conn, "users", "is_admin", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "users", "is_supporter", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "users", "is_approved", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "users", "is_banned", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "users", "own_profile_url", "TEXT DEFAULT ''")
-        _ensure_column(conn, "users", "own_profile_name", "TEXT DEFAULT ''")
-        _ensure_column(conn, "users", "show_on_leaderboard", "INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "users", "last_seen", "TEXT")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                token       TEXT PRIMARY KEY,
-                twitch_id   TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                expires_at  TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS favorites (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id       INTEGER NOT NULL,
-                profile_url   TEXT NOT NULL,
-                profile_name  TEXT NOT NULL,
-                created_at    TEXT NOT NULL,
-                UNIQUE (user_id, profile_url)
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS progress_snapshots (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id         INTEGER NOT NULL,
-                taken_at        TEXT NOT NULL,
-                distinct_owned  INTEGER NOT NULL,
-                distinct_total  INTEGER NOT NULL,
-                total_copies    INTEGER NOT NULL,
-                missing_count   INTEGER NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_snapshots_user ON progress_snapshots (user_id, id)"
-        )
-        conn.commit()
+    """Firestore braucht kein Schema. Die Funktion bleibt, damit bestehende Aufrufer
+    (auth_ui.render_login_gate() usw.) unverändert funktionieren."""
+    fb.get_client()
 
 
 # ---------------------------------------------------------------------------
@@ -157,17 +90,30 @@ def get_user_by_id(user_id: Any) -> Optional[Dict[str, Any]]:
         uid = int(user_id)
     except (TypeError, ValueError):
         return None
-    with _connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    return _row_to_user(row)
+    snap = _users().document(str(uid)).get()
+    return _doc_to_user(snap.to_dict()) if snap.exists else None
 
 
 def get_user_by_twitch_id(twitch_id: Any) -> Optional[Dict[str, Any]]:
     if twitch_id is None:
         return None
-    with _connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE twitch_id = ?", (str(twitch_id),)).fetchone()
-    return _row_to_user(row)
+    idx = _fs().collection("twitch_index").document(str(twitch_id)).get()
+    if not idx.exists:
+        return None
+    return get_user_by_id(idx.to_dict().get("id"))
+
+
+@firestore.transactional
+def _create_user_txn(txn, idx_ref, counter_ref, users_col, data):
+    idx = idx_ref.get(transaction=txn)
+    if idx.exists:
+        return idx.to_dict()["id"], False
+    c = counter_ref.get(transaction=txn)
+    nxt = (c.to_dict().get("users", 0) if c.exists else 0) + 1
+    txn.set(counter_ref, {"users": nxt}, merge=True)
+    txn.set(users_col.document(str(nxt)), {**data, "id": nxt})
+    txn.set(idx_ref, {"id": nxt})
+    return nxt, True
 
 
 def get_or_create_user(twitch_id: str, twitch_username: str,
@@ -175,125 +121,107 @@ def get_or_create_user(twitch_id: str, twitch_username: str,
     """Legt den Account beim ersten Login an (noch NICHT freigegeben) oder aktualisiert
     bei bestehenden Accounts Anzeigename und Profilbild von Twitch."""
     twitch_id = str(twitch_id)
-    with _connect() as conn:
-        row = conn.execute("SELECT id FROM users WHERE twitch_id = ?", (twitch_id,)).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE users SET twitch_username = ?, profile_image_url = ? WHERE id = ?",
-                (twitch_username, profile_image_url or "", row["id"]),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO users (twitch_id, twitch_username, profile_image_url, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (twitch_id, twitch_username, profile_image_url or "", _utc_now_iso()),
-            )
-        conn.commit()
-    return get_user_by_twitch_id(twitch_id)  # type: ignore[return-value]
+    fs = _fs()
+    data = {
+        "twitch_id": twitch_id,
+        "twitch_username": twitch_username,
+        "profile_image_url": profile_image_url or "",
+        "is_admin": False, "is_supporter": False, "is_approved": False, "is_banned": False,
+        "own_profile_url": "", "own_profile_name": "",
+        "show_on_leaderboard": True, "last_seen": None,
+        "created_at": _utc_now_iso(),
+    }
+    uid, created = _create_user_txn(
+        fs.transaction(), fs.collection("twitch_index").document(twitch_id),
+        fs.collection("meta").document("counters"), _users(), data,
+    )
+    if not created:
+        _users().document(str(uid)).update(
+            {"twitch_username": twitch_username, "profile_image_url": profile_image_url or ""}
+        )
+    return get_user_by_id(uid)  # type: ignore[return-value]
 
 
 def get_all_users() -> List[Dict[str, Any]]:
     """Alle Accounts (Admins zuerst, dann Supporter, dann alphabetisch)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM users ORDER BY is_admin DESC, is_supporter DESC, "
-            "LOWER(twitch_username) ASC"
-        ).fetchall()
-    return [_row_to_user(r) for r in rows]  # type: ignore[misc]
+    users = [_doc_to_user(s.to_dict()) for s in _users().stream()]
+    users.sort(key=lambda u: (not u["is_admin"], not u["is_supporter"],
+                              (u.get("twitch_username") or "").lower()))
+    return users  # type: ignore[return-value]
 
 
 def search_users_by_username(query: str, exclude_user_id: Optional[int] = None,
                              limit: int = 20) -> List[Dict[str, Any]]:
     """Teilstring-Suche (ohne Groß-/Kleinschreibung) über Twitch-Namen - nur freigegebene,
-    nicht gesperrte Accounts, da nur diese die App überhaupt nutzen können."""
-    q = (query or "").strip()
+    nicht gesperrte Accounts."""
+    q = (query or "").strip().lower()
     if not q:
         return []
-    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-    sql = ("SELECT * FROM users WHERE twitch_username LIKE ? ESCAPE '\\' "
-           "AND is_approved = 1 AND is_banned = 0")
-    params: List[Any] = [like]
-    if exclude_user_id is not None:
-        sql += " AND id != ?"
-        params.append(int(exclude_user_id))
-    sql += " ORDER BY LOWER(twitch_username) ASC LIMIT ?"
-    params.append(limit)
-    with _connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    return [_row_to_user(r) for r in rows]  # type: ignore[misc]
+    now = time.time()
+    if now - _search_cache["ts"] > _SEARCH_CACHE_TTL:
+        _search_cache["users"] = [u for u in get_all_users() if u["is_approved"] and not u["is_banned"]]
+        _search_cache["ts"] = now
+    out = [u for u in _search_cache["users"]
+           if q in (u.get("twitch_username") or "").lower()
+           and (exclude_user_id is None or u["id"] != int(exclude_user_id))]
+    out.sort(key=lambda u: (u.get("twitch_username") or "").lower())
+    return out[:limit]
 
 
-def _set_flag(user_id: int, column: str, value: bool) -> None:
-    # column kommt ausschließlich aus dem Code unten, nie aus Nutzereingaben
-    with _connect() as conn:
-        conn.execute(f"UPDATE users SET {column} = ? WHERE id = ?", (1 if value else 0, int(user_id)))
-        conn.commit()
+def _update(user_id: int, fields: Dict[str, Any]) -> None:
+    _users().document(str(int(user_id))).update(fields)
+    _search_cache["ts"] = 0.0  # Rollen/Sperren sofort in der Suche berücksichtigen
 
 
 def set_approved(user_id: int, approved: bool) -> None:
-    _set_flag(user_id, "is_approved", approved)
+    _update(user_id, {"is_approved": bool(approved)})
 
 
 def set_banned(user_id: int, banned: bool) -> None:
     """Sperren entzieht zugleich die Freigabe. Entsperren stellt sie NICHT automatisch
     wieder her (dafür gibt es set_approved)."""
-    with _connect() as conn:
-        if banned:
-            conn.execute("UPDATE users SET is_banned = 1, is_approved = 0 WHERE id = ?", (int(user_id),))
-        else:
-            conn.execute("UPDATE users SET is_banned = 0 WHERE id = ?", (int(user_id),))
-        conn.commit()
+    if banned:
+        _update(user_id, {"is_banned": True, "is_approved": False})
+    else:
+        _update(user_id, {"is_banned": False})
 
 
 def set_admin(user_id: int, is_admin: bool) -> None:
-    """Admin-Recht vergeben/entziehen. Beim Vergeben wird der Account automatisch freigegeben
-    (und entsperrt)."""
-    with _connect() as conn:
-        if is_admin:
-            conn.execute(
-                "UPDATE users SET is_admin = 1, is_approved = 1, is_banned = 0 WHERE id = ?",
-                (int(user_id),),
-            )
-        else:
-            conn.execute("UPDATE users SET is_admin = 0 WHERE id = ?", (int(user_id),))
-        conn.commit()
+    """Beim Vergeben wird der Account automatisch freigegeben (und entsperrt)."""
+    if is_admin:
+        _update(user_id, {"is_admin": True, "is_approved": True, "is_banned": False})
+    else:
+        _update(user_id, {"is_admin": False})
 
 
 def set_supporter(user_id: int, is_supporter: bool) -> None:
-    """Supporter-Rang vergeben/entziehen. Supporter dürfen moderieren und müssen dafür selbst
-    freigegeben sein - beim Vergeben wird der Account daher automatisch freigegeben."""
-    with _connect() as conn:
-        if is_supporter:
-            conn.execute(
-                "UPDATE users SET is_supporter = 1, is_approved = 1, is_banned = 0 WHERE id = ?",
-                (int(user_id),),
-            )
-        else:
-            conn.execute("UPDATE users SET is_supporter = 0 WHERE id = ?", (int(user_id),))
-        conn.commit()
+    """Beim Vergeben wird der Account automatisch freigegeben (und entsperrt)."""
+    if is_supporter:
+        _update(user_id, {"is_supporter": True, "is_approved": True, "is_banned": False})
+    else:
+        _update(user_id, {"is_supporter": False})
 
 
 def revoke_all_approvals_except_admins() -> int:
     """Entzieht allen Nicht-Admins die Freigabe. Gibt die Zahl der betroffenen Accounts zurück."""
-    with _connect() as conn:
-        cur = conn.execute(
-            "UPDATE users SET is_approved = 0 WHERE is_admin = 0 AND is_approved = 1"
-        )
-        conn.commit()
-        return cur.rowcount
+    batch = _fs().batch()
+    n = 0
+    for s in _users().where("is_approved", "==", True).stream():
+        if not s.to_dict().get("is_admin"):
+            batch.update(s.reference, {"is_approved": False})
+            n += 1
+    if n:
+        batch.commit()
+        _search_cache["ts"] = 0.0
+    return n
 
 
 def set_own_profile(user_id: int, profile_url: str, profile_name: str) -> None:
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE users SET own_profile_url = ?, own_profile_name = ? WHERE id = ?",
-            (profile_url or "", profile_name or "", int(user_id)),
-        )
-        conn.commit()
+    _update(user_id, {"own_profile_url": profile_url or "", "own_profile_name": profile_name or ""})
 
 
 def set_leaderboard_visible(user_id: int, visible: bool) -> None:
-    _set_flag(user_id, "show_on_leaderboard", visible)
+    _update(user_id, {"show_on_leaderboard": bool(visible)})
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +229,12 @@ def set_leaderboard_visible(user_id: int, visible: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def touch_last_seen(user_id: int) -> None:
-    with _connect() as conn:
-        conn.execute("UPDATE users SET last_seen = ? WHERE id = ?", (_utc_now_iso(), int(user_id)))
-        conn.commit()
+    uid = int(user_id)
+    now = time.time()
+    if now - _last_touch.get(uid, 0.0) < _TOUCH_MIN_INTERVAL:
+        return
+    _last_touch[uid] = now
+    _users().document(str(uid)).update({"last_seen": _utc_now_iso()})
 
 
 def is_user_online(last_seen: Optional[str]) -> bool:
@@ -325,146 +256,123 @@ def is_user_online(last_seen: Optional[str]) -> bool:
 def create_session(twitch_id: str) -> str:
     token = secrets.token_urlsafe(32)
     now = _utc_now()
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO sessions (token, twitch_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, str(twitch_id), now.isoformat(timespec="seconds"),
-             (now + timedelta(days=SESSION_LIFETIME_DAYS)).isoformat(timespec="seconds")),
-        )
-        conn.commit()
+    _fs().collection("sessions").document(token).set({
+        "twitch_id": str(twitch_id),
+        "created_at": now.isoformat(timespec="seconds"),
+        "expires_at": (now + timedelta(days=SESSION_LIFETIME_DAYS)).isoformat(timespec="seconds"),
+    })
     return token
 
 
 def get_user_by_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
     if not token:
         return None
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT twitch_id, expires_at FROM sessions WHERE token = ?", (token,)
-        ).fetchone()
-    if not row:
+    snap = _fs().collection("sessions").document(token).get()
+    if not snap.exists:
         return None
+    d = snap.to_dict()
     try:
-        if datetime.fromisoformat(row["expires_at"]) < _utc_now():
+        if datetime.fromisoformat(d["expires_at"]) < _utc_now():
             delete_session(token)
             return None
-    except ValueError:
+    except (ValueError, KeyError):
         return None
-    return get_user_by_twitch_id(row["twitch_id"])
+    return get_user_by_twitch_id(d.get("twitch_id"))
 
 
 def delete_session(token: Optional[str]) -> None:
-    if not token:
-        return
-    with _connect() as conn:
-        conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
-        conn.commit()
+    if token:
+        _fs().collection("sessions").document(token).delete()
 
 
 def delete_expired_sessions() -> None:
-    with _connect() as conn:
-        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (_utc_now_iso(),))
-        conn.commit()
+    batch = _fs().batch()
+    n = 0
+    for s in _fs().collection("sessions").where("expires_at", "<", _utc_now_iso()).limit(400).stream():
+        batch.delete(s.reference)
+        n += 1
+    if n:
+        batch.commit()
 
 
 # ---------------------------------------------------------------------------
 # Favoriten
 # ---------------------------------------------------------------------------
 
+def _fav_col(user_id: int):
+    return _users().document(str(int(user_id))).collection("favorites")
+
+
+def _fav_id(profile_url: str) -> str:
+    return hashlib.sha1(profile_url.encode("utf-8")).hexdigest()
+
+
 def get_favorites(user_id: int) -> List[Dict[str, Any]]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM favorites WHERE user_id = ? ORDER BY LOWER(profile_name) ASC",
-            (int(user_id),),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    rows = [s.to_dict() for s in _fav_col(user_id).stream()]
+    for r in rows:
+        r["user_id"] = int(user_id)
+    rows.sort(key=lambda r: (r.get("profile_name") or "").lower())
+    return rows
 
 
 def is_favorite(user_id: int, profile_url: str) -> bool:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM favorites WHERE user_id = ? AND profile_url = ?",
-            (int(user_id), profile_url),
-        ).fetchone()
-    return row is not None
+    return _fav_col(user_id).document(_fav_id(profile_url)).get().exists
 
 
 def add_favorite(user_id: int, profile_url: str, profile_name: str) -> None:
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO favorites (user_id, profile_url, profile_name, created_at) "
-            "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(user_id, profile_url) DO UPDATE SET profile_name = excluded.profile_name",
-            (int(user_id), profile_url, profile_name, _utc_now_iso()),
-        )
-        conn.commit()
+    ref = _fav_col(user_id).document(_fav_id(profile_url))
+    if ref.get().exists:
+        ref.update({"profile_name": profile_name})
+    else:
+        ref.set({"profile_url": profile_url, "profile_name": profile_name,
+                 "created_at": _utc_now_iso()})
 
 
 def remove_favorite(user_id: int, profile_url: str) -> None:
-    with _connect() as conn:
-        conn.execute(
-            "DELETE FROM favorites WHERE user_id = ? AND profile_url = ?",
-            (int(user_id), profile_url),
-        )
-        conn.commit()
+    _fav_col(user_id).document(_fav_id(profile_url)).delete()
 
 
 # ---------------------------------------------------------------------------
 # Fortschritt & Bestenliste
 # ---------------------------------------------------------------------------
 
+_SNAP_FIELDS = ("distinct_owned", "distinct_total", "total_copies", "missing_count")
+
+
 def add_progress_snapshot(user_id: int, distinct_owned: int, distinct_total: int,
                           total_copies: int, missing_count: int) -> None:
-    """Speichert einen Fortschritts-Schnappschuss. Ist der Stand identisch zum letzten
-    Schnappschuss, wird nichts gespeichert (die App ruft das bei jedem Profil-Laden auf)."""
-    with _connect() as conn:
-        last = conn.execute(
-            "SELECT distinct_owned, distinct_total, total_copies, missing_count "
-            "FROM progress_snapshots WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (int(user_id),),
-        ).fetchone()
-        new = (int(distinct_owned), int(distinct_total), int(total_copies), int(missing_count))
-        if last and tuple(last) == new:
-            return
-        conn.execute(
-            "INSERT INTO progress_snapshots (user_id, taken_at, distinct_owned, distinct_total, "
-            "total_copies, missing_count) VALUES (?, ?, ?, ?, ?, ?)",
-            (int(user_id), _utc_now_iso(), *new),
-        )
-        conn.commit()
+    """Speichert einen Fortschritts-Schnappschuss; identischer Stand wie der letzte wird
+    übersprungen. Der neueste Stand steht zusätzlich im User-Dokument (für die Bestenliste)."""
+    uid = int(user_id)
+    new = dict(zip(_SNAP_FIELDS, (int(distinct_owned), int(distinct_total),
+                                  int(total_copies), int(missing_count))))
+    user_ref = _users().document(str(uid))
+    snap = user_ref.get()
+    last = (snap.to_dict() or {}).get("latest_snapshot") if snap.exists else None
+    if last and all(last.get(k) == new[k] for k in _SNAP_FIELDS):
+        return
+    taken_at = _utc_now_iso()
+    user_ref.collection("snapshots").add({**new, "taken_at": taken_at})
+    user_ref.update({"latest_snapshot": {**new, "taken_at": taken_at}})
 
 
 def get_progress_history(user_id: int, limit: int = 200) -> List[Dict[str, Any]]:
     """Die letzten `limit` Schnappschüsse, ältester zuerst (für das Verlaufsdiagramm)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM (SELECT * FROM progress_snapshots WHERE user_id = ? "
-            "ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
-            (int(user_id), limit),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    docs = (_users().document(str(int(user_id))).collection("snapshots")
+            .order_by("taken_at", direction=firestore.Query.DESCENDING).limit(limit).stream())
+    rows = [dict(d.to_dict(), user_id=int(user_id)) for d in docs]
+    rows.reverse()
+    return rows
 
 
 def get_leaderboard(limit: int = 50) -> List[Dict[str, Any]]:
     """Neuester Schnappschuss je sichtbarem, nicht gesperrtem Account, bester zuerst."""
-    with _connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT u.id AS user_id, u.twitch_username, s.distinct_owned, s.distinct_total,
-                   s.total_copies, s.missing_count, s.taken_at
-            FROM users u
-            JOIN progress_snapshots s ON s.id = (
-                SELECT MAX(id) FROM progress_snapshots WHERE user_id = u.id
-            )
-            WHERE u.show_on_leaderboard = 1 AND u.is_banned = 0
-            ORDER BY s.distinct_owned DESC, s.total_copies DESC, LOWER(u.twitch_username) ASC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-# Datenbank beim Import initialisieren (auth_ui.render_login_gate() ruft init_db() ohnehin
-# nochmal auf - mehrfacher Aufruf ist unkritisch).
-init_db()
+    out: List[Dict[str, Any]] = []
+    for s in _users().where("show_on_leaderboard", "==", True).stream():
+        d = s.to_dict()
+        snap = d.get("latest_snapshot")
+        if d.get("is_banned") or not snap:
+            continue
+        out.append({"user_id": d["id"], "twitch_username": d.get("twitch_username", ""), **snap})
+    out.sort(key=lambda r: (-r["distinct_owned"], -r["total_copies"], r["twitch_username"].lower()))
+    return out[:limit]
