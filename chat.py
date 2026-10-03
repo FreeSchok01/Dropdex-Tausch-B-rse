@@ -18,7 +18,7 @@ Firestore:
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from google.cloud import firestore
 
@@ -42,6 +42,26 @@ def _conv_ref(a: int, b: int):
 
 def _counter_ref(user_id: int):
     return _fs().collection("counters").document(f"chat_{int(user_id)}")
+
+
+# Caches, die nur dann neu laden, wenn sich der Zähler (unread + Version "v" im Counter-Dokument,
+# per Live-Listener überwacht) geändert hat oder man selbst geschrieben hat. Sonst: 0 Lesezugriffe.
+_conv_cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+_ov_cache: Dict[int, Dict[str, Any]] = {}
+_read_ok: Dict[Tuple[int, int], int] = {}
+
+
+def _version(uid: int) -> int:
+    return int(fb.watched(_counter_ref(uid)).get("v", 0) or 0)
+
+
+def _bump_peek(uid: int, d_unread: int = 0, set_unread: Any = None) -> None:
+    """Zieht den überwachten Zähler nach eigenem Schreibzugriff sofort nach (falls überwacht)."""
+    cur = fb.watched_peek(_counter_ref(uid))
+    if cur is None:
+        return
+    un = set_unread if set_unread is not None else max(0, int(cur.get("unread", 0) or 0) + d_unread)
+    fb.watched_override(_counter_ref(uid), {**cur, "unread": un, "v": int(cur.get("v", 0) or 0) + 1})
 
 
 def _ts() -> str:
@@ -73,43 +93,76 @@ def send_message(from_user_id: int, to_user_id: int, body: str) -> None:
         "last_message": text, "last_at": now_local, "last_ts": ts,
         "unread": {str(int(to_user_id)): firestore.Increment(1)},
     }, merge=True)
-    batch.set(_counter_ref(to_user_id), {"unread": firestore.Increment(1)}, merge=True)
+    batch.set(_counter_ref(to_user_id), {"unread": firestore.Increment(1), "v": firestore.Increment(1)},
+              merge=True)
     batch.commit()
+    _bump_peek(int(to_user_id), +1)
+    _ov_cache.pop(int(from_user_id), None)
+    _ov_cache.pop(int(to_user_id), None)
+    c = _conv_cache.get((int(from_user_id), int(to_user_id)))
+    if c:
+        c["dirty"] = True
 
 
 def get_conversation(user_id: int, partner_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    """Die letzten `limit` Nachrichten zwischen den beiden Nutzern, älteste zuerst."""
-    docs = (_conv_ref(user_id, partner_id).collection("messages")
-            .order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).stream())
-    rows = [dict(d.to_dict(), id=d.id) for d in docs]
-    rows.reverse()
-    return rows
+    """Die letzten `limit` Nachrichten zwischen den beiden Nutzern, älteste zuerst. Beim ersten
+    Öffnen werden bis zu `limit` Nachrichten gelesen, danach nur noch NEUE (ts > letzte bekannte)."""
+    uid, pid = int(user_id), int(partner_id)
+    k = (uid, pid)
+    v = _version(uid)
+    c = _conv_cache.get(k)
+    msgs = _conv_ref(uid, pid).collection("messages")
+    if c is None:
+        docs = msgs.order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).stream()
+        rows = [dict(d.to_dict(), id=d.id) for d in docs]
+        rows.reverse()
+        c = {"rows": rows}
+    elif c["v"] != v or c["dirty"]:
+        last = c["rows"][-1]["ts"] if c["rows"] else ""
+        have = {r["id"] for r in c["rows"]}
+        new = [dict(d.to_dict(), id=d.id)
+               for d in msgs.where("ts", ">", last).order_by("ts").stream() if d.id not in have]
+        c["rows"] = (c["rows"] + new)[-max(limit, 100):]
+    c["v"], c["dirty"] = v, False
+    _conv_cache[k] = c
+    return [dict(r) for r in c["rows"][-limit:]]
 
 
 def mark_conversation_read(user_id: int, partner_id: int) -> None:
     """Markiert alle eingehenden Nachrichten von `partner_id` als gelesen (wird aufgerufen,
-    sobald die Unterhaltung geöffnet wird). Kostet nur dann weitere Zugriffe, wenn es wirklich
-    ungelesene Nachrichten gibt."""
-    conv = _conv_ref(user_id, partner_id)
-    snap = conv.get()
-    if not snap.exists:
+    sobald die Unterhaltung geöffnet wird). Kostet nur dann Zugriffe, wenn sich der Zähler seit
+    der letzten Prüfung geändert hat."""
+    uid, pid = int(user_id), int(partner_id)
+    k = (uid, pid)
+    v = _version(uid)
+    if _read_ok.get(k) == v:
         return
-    n = int((snap.to_dict().get("unread") or {}).get(str(int(user_id)), 0) or 0)
+    conv = _conv_ref(uid, pid)
+    snap = conv.get()
+    n = int(((snap.to_dict() or {}).get("unread") or {}).get(str(uid), 0) or 0) if snap.exists else 0
     if n <= 0:
+        _read_ok[k] = v
         return
     batch = _fs().batch()
-    for d in (conv.collection("messages").where("to_user_id", "==", int(user_id))
+    for d in (conv.collection("messages").where("to_user_id", "==", uid)
               .where("is_read", "==", False).stream()):
         batch.update(d.reference, {"is_read": True})
-    batch.set(conv, {"unread": {str(int(user_id)): 0}}, merge=True)
-    batch.set(_counter_ref(user_id), {"unread": firestore.Increment(-n)}, merge=True)
+    batch.set(conv, {"unread": {str(uid): 0}}, merge=True)
+    batch.set(_counter_ref(uid), {"unread": firestore.Increment(-n), "v": firestore.Increment(1)}, merge=True)
     batch.commit()
+    _bump_peek(uid, -n)
+    _ov_cache.pop(uid, None)
+    _read_ok[k] = _version(uid)
 
 
 def get_conversations_overview(user_id: int) -> List[Dict[str, Any]]:
     """Liste aller Unterhaltungen: pro Gesprächspartner die letzte Nachricht, deren Zeitpunkt
     und die Anzahl ungelesener Nachrichten von ihm. Neueste Unterhaltung zuerst."""
     uid = int(user_id)
+    v = _version(uid)
+    cached = _ov_cache.get(uid)
+    if cached and cached["v"] == v:
+        return [dict(x) for x in cached["rows"]]
     convos = []
     total_unread = 0
     for d in _fs().collection("conversations").where("participants", "array_contains", uid).stream():
@@ -127,8 +180,9 @@ def get_conversations_overview(user_id: int) -> List[Dict[str, Any]]:
         c.pop("_ts", None)
     # Gesamtzähler selbst heilen, falls er vom echten Wert abweicht
     if total_unread != unread_count(uid):
-        _counter_ref(uid).set({"unread": total_unread})
-        fb.watched_override(_counter_ref(uid), {"unread": total_unread})
+        _counter_ref(uid).set({"unread": total_unread, "v": firestore.Increment(1)}, merge=True)
+        _bump_peek(uid, set_unread=total_unread)
+    _ov_cache[uid] = {"v": _version(uid), "rows": [dict(x) for x in convos]}
     return convos
 
 
