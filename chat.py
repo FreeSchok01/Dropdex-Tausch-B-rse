@@ -1,131 +1,137 @@
 # -*- coding: utf-8 -*-
 """
-chat.py
-=======
-Eigenständiges Mini-Modul für den "💬 Chat"-Reiter: direkte 1:1-Nachrichten
-zwischen zwei registrierten Accounts (Twitch-Login über auth_ui.py/db.py).
+chat.py  (Firestore-Version)
+============================
+Direkte 1:1-Nachrichten zwischen zwei registrierten Accounts (Twitch-Login über
+auth_ui.py/db.py). Ein Chat gibt es nur zwischen zwei registrierten Accounts - den Partner
+findet man immer über die Twitch-Username-Suche (db.search_users_by_username).
 
-Nutzt bewusst eine EIGENE, kleine SQLite-Datei (nicht db.py) – so ist diese
-Funktion sofort einsatzbereit, ohne das bestehende db.py-Schema anzufassen
-(gleiches Muster wie notifications.py und trade_watch.py).
+Die Chat-Seite lädt bewusst NICHT automatisch neu - es gibt einen manuellen
+"🔄 Aktualisieren"-Button in der UI.
 
-Ein Chat kann nur zwischen zwei registrierten Accounts stattfinden (user_id
-aus db.py) – NICHT mit beliebigen, nur über eine Dropdex-Profil-URL bekannten
-Personen, da diese nicht zwangsläufig eingeloggt bzw. erreichbar sind. Der
-Partner wird daher immer über die Twitch-Username-Suche (db.search_users_by_username)
-gefunden, unabhängig von Tausch-Match-Ergebnissen.
-
-Die Chat-Seite wird bewusst NICHT automatisch neu geladen (kein zusätzlicher
-Timer neben dem 5s-Hintergrundcheck in der Haupt-App) – stattdessen gibt es
-einen manuellen "🔄 Aktualisieren"-Button in der UI.
+Firestore:
+  conversations/{a}_{b}                 (a < b, User-IDs)  participants, last_message, last_at,
+                                        last_ts, unread: {"<uid>": n}
+  conversations/{a}_{b}/messages/{auto} from_user_id, to_user_id, body, created_at, ts, is_read
+  counters/chat_{uid}                   {unread: n}  - Gesamtzähler für das Sidebar-Badge
+                                        (per Live-Listener im Speicher, siehe fb.watched)
 """
 
-import os
-import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.db")
+from google.cloud import firestore
+
+import fb
+
+MAX_MESSAGE_LENGTH = 2000
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _fs():
+    return fb.get_client()
+
+
+def _conv_id(a: int, b: int) -> str:
+    lo, hi = sorted((int(a), int(b)))
+    return f"{lo}_{hi}"
+
+
+def _conv_ref(a: int, b: int):
+    return _fs().collection("conversations").document(_conv_id(a, b))
+
+
+def _counter_ref(user_id: int):
+    return _fs().collection("counters").document(f"chat_{int(user_id)}")
+
+
+def _ts() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def init_db() -> None:
-    """Legt die Tabelle an, falls sie noch nicht existiert. Mehrfacher Aufruf ist unkritisch."""
-    with _connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_user_id  INTEGER NOT NULL,
-                to_user_id    INTEGER NOT NULL,
-                body          TEXT NOT NULL,
-                created_at    TEXT NOT NULL,
-                is_read       INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_messages_from_to ON messages (from_user_id, to_user_id)"
-        )
-        conn.commit()
+    """Bleibt aus Kompatibilitätsgründen erhalten - Firestore braucht kein Schema."""
+    fb.get_client()
 
 
 def send_message(from_user_id: int, to_user_id: int, body: str) -> None:
-    """Legt eine neue Nachricht von `from_user_id` an `to_user_id` an. Leere/reine
-    Whitespace-Nachrichten werden stillschweigend ignoriert."""
-    text = (body or "").strip()
-    if not text or from_user_id == to_user_id:
+    """Legt eine neue Nachricht an. Leere Nachrichten und Nachrichten an sich selbst werden
+    stillschweigend ignoriert; zu lange Texte werden auf MAX_MESSAGE_LENGTH gekürzt."""
+    text = (body or "").strip()[:MAX_MESSAGE_LENGTH]
+    if not text or int(from_user_id) == int(to_user_id):
         return
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO messages (from_user_id, to_user_id, body, created_at, is_read) "
-            "VALUES (?, ?, ?, ?, 0)",
-            (from_user_id, to_user_id, text, datetime.now().isoformat(timespec="seconds")),
-        )
-        conn.commit()
+    now_local = datetime.now().isoformat(timespec="seconds")
+    ts = _ts()
+    conv = _conv_ref(from_user_id, to_user_id)
+    msg_ref = conv.collection("messages").document()
+    batch = _fs().batch()
+    batch.set(msg_ref, {
+        "from_user_id": int(from_user_id), "to_user_id": int(to_user_id), "body": text,
+        "created_at": now_local, "ts": ts, "is_read": False,
+    })
+    batch.set(conv, {
+        "participants": [int(from_user_id), int(to_user_id)],
+        "last_message": text, "last_at": now_local, "last_ts": ts,
+        "unread": {str(int(to_user_id)): firestore.Increment(1)},
+    }, merge=True)
+    batch.set(_counter_ref(to_user_id), {"unread": firestore.Increment(1)}, merge=True)
+    batch.commit()
 
 
-def get_conversation(user_id: int, partner_id: int, limit: int = 300) -> List[Dict[str, Any]]:
-    """Alle Nachrichten zwischen `user_id` und `partner_id`, älteste zuerst (für die
-    Chronik-Anzeige von oben nach unten)."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE "
-            "(from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?) "
-            "ORDER BY id ASC LIMIT ?",
-            (user_id, partner_id, partner_id, user_id, limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+def get_conversation(user_id: int, partner_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """Die letzten `limit` Nachrichten zwischen den beiden Nutzern, älteste zuerst."""
+    docs = (_conv_ref(user_id, partner_id).collection("messages")
+            .order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).stream())
+    rows = [dict(d.to_dict(), id=d.id) for d in docs]
+    rows.reverse()
+    return rows
 
 
 def mark_conversation_read(user_id: int, partner_id: int) -> None:
-    """Markiert alle eingehenden Nachrichten von `partner_id` an `user_id` als gelesen
-    (wird aufgerufen, sobald diese Unterhaltung geöffnet wird)."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE messages SET is_read = 1 WHERE to_user_id = ? AND from_user_id = ? AND is_read = 0",
-            (user_id, partner_id),
-        )
-        conn.commit()
+    """Markiert alle eingehenden Nachrichten von `partner_id` als gelesen (wird aufgerufen,
+    sobald die Unterhaltung geöffnet wird). Kostet nur dann weitere Zugriffe, wenn es wirklich
+    ungelesene Nachrichten gibt."""
+    conv = _conv_ref(user_id, partner_id)
+    snap = conv.get()
+    if not snap.exists:
+        return
+    n = int((snap.to_dict().get("unread") or {}).get(str(int(user_id)), 0) or 0)
+    if n <= 0:
+        return
+    batch = _fs().batch()
+    for d in (conv.collection("messages").where("to_user_id", "==", int(user_id))
+              .where("is_read", "==", False).stream()):
+        batch.update(d.reference, {"is_read": True})
+    batch.set(conv, {"unread": {str(int(user_id)): 0}}, merge=True)
+    batch.set(_counter_ref(user_id), {"unread": firestore.Increment(-n)}, merge=True)
+    batch.commit()
 
 
 def get_conversations_overview(user_id: int) -> List[Dict[str, Any]]:
-    """Liste aller Unterhaltungen von `user_id`: pro Gesprächspartner die letzte
-    Nachricht, deren Zeitpunkt und die Anzahl ungelesener Nachrichten von ihm.
-    Neueste Unterhaltung zuerst."""
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM messages WHERE from_user_id = ? OR to_user_id = ? ORDER BY id DESC",
-            (user_id, user_id),
-        ).fetchall()
-
-    convos: Dict[int, Dict[str, Any]] = {}
-    for r in rows:
-        row = dict(r)
-        partner_id = row["to_user_id"] if row["from_user_id"] == user_id else row["from_user_id"]
-        if partner_id not in convos:
-            convos[partner_id] = {
-                "partner_id": partner_id,
-                "last_message": row["body"],
-                "last_at": row["created_at"],
-                "unread": 0,
-            }
-        if row["to_user_id"] == user_id and not row["is_read"]:
-            convos[partner_id]["unread"] += 1
-    return list(convos.values())
+    """Liste aller Unterhaltungen: pro Gesprächspartner die letzte Nachricht, deren Zeitpunkt
+    und die Anzahl ungelesener Nachrichten von ihm. Neueste Unterhaltung zuerst."""
+    uid = int(user_id)
+    convos = []
+    total_unread = 0
+    for d in _fs().collection("conversations").where("participants", "array_contains", uid).stream():
+        x = d.to_dict()
+        partner = next((p for p in x.get("participants", []) if int(p) != uid), None)
+        if partner is None:
+            continue
+        unread = int((x.get("unread") or {}).get(str(uid), 0) or 0)
+        total_unread += unread
+        convos.append({"partner_id": int(partner), "last_message": x.get("last_message", ""),
+                       "last_at": x.get("last_at", ""), "unread": unread,
+                       "_ts": x.get("last_ts", "")})
+    convos.sort(key=lambda c: c["_ts"], reverse=True)
+    for c in convos:
+        c.pop("_ts", None)
+    # Gesamtzähler selbst heilen, falls er vom echten Wert abweicht
+    if total_unread != unread_count(uid):
+        _counter_ref(uid).set({"unread": total_unread})
+        fb.watched_override(_counter_ref(uid), {"unread": total_unread})
+    return convos
 
 
 def unread_count(user_id: int) -> int:
-    """Gesamtzahl ungelesener Nachrichten über alle Unterhaltungen hinweg (für das
-    Badge neben "💬 Chat" in der Sidebar, analog zu notifications.unread_count())."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM messages WHERE to_user_id = ? AND is_read = 0",
-            (user_id,),
-        ).fetchone()
-        return int(row["c"]) if row else 0
+    """Gesamtzahl ungelesener Nachrichten (für das Badge neben "💬 Chat" in der Sidebar)."""
+    return max(0, int(fb.watched(_counter_ref(user_id)).get("unread", 0) or 0))
