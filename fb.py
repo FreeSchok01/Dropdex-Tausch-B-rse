@@ -44,6 +44,20 @@ def _load_credentials_dict() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _normalize_private_key(key: str) -> str:
+    """Baut den PEM-Schlüssel sauber neu zusammen. Fängt typische Fehler beim Einfügen ab:
+    wörtliche "\\n" statt Zeilenumbrüchen, verlorene Zeilenumbrüche, zusätzliche Leerzeichen
+    oder Anführungszeichen."""
+    import re
+    k = key.strip().strip('"').strip("'").replace("\\n", "\n")
+    m = re.search(r"-----BEGIN PRIVATE KEY-----(.*?)-----END PRIVATE KEY-----", k, re.S)
+    if not m:
+        return k
+    body = re.sub(r"[^A-Za-z0-9+/=]", "", m.group(1))
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    return "-----BEGIN PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END PRIVATE KEY-----\n"
+
+
 def get_client():
     """Gibt den (einmalig erzeugten) Firestore-Client zurück."""
     global _client
@@ -56,10 +70,16 @@ def get_client():
                 "Keine Firebase-Zugangsdaten gefunden. Lege den Service-Account-Schlüssel in "
                 ".streamlit/secrets.toml unter [firebase] ab (siehe fb.py)."
             )
-        # Zeilenumbrüche im private_key können beim Kopieren als "\\n" ankommen
         if isinstance(data.get("private_key"), str):
-            data["private_key"] = data["private_key"].replace("\\n", "\n")
-        firebase_admin.initialize_app(credentials.Certificate(data))
+            data["private_key"] = _normalize_private_key(data["private_key"])
+        try:
+            firebase_admin.initialize_app(credentials.Certificate(data))
+        except ValueError as exc:
+            raise RuntimeError(
+                "Der Firebase-private_key ist beschädigt (vermutlich beim Einfügen in die Secrets "
+                "abgeschnitten oder verändert). Erzeuge einen neuen Schlüssel und trage ihn "
+                "mit dem Umwandlungs-Befehl aus der Anleitung ein."
+            ) from exc
     _client = firestore.client()
     return _client
 
