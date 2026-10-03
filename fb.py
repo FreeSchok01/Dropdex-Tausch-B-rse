@@ -112,6 +112,7 @@ def get_client():
 
 import threading
 import time
+from typing import Callable, List, Tuple
 
 _watched: Dict[str, Dict[str, Any]] = {}
 _watched_lock = threading.Lock()
@@ -169,3 +170,70 @@ class TTLCache:
 
     def clear(self) -> None:
         self._data.clear()
+
+
+# ---------------------------------------------------------------------------
+# Live-Abfragen (Collection/Query im Speicher, abgerechnet wird nur bei Änderungen)
+# ---------------------------------------------------------------------------
+# watched_query(key, make_query) hält das Ergebnis einer Collection oder Query per Listener im
+# Speicher. Gelesen wird einmal beim Start (N Dokumente), danach kostet nur noch jedes
+# GEÄNDERTE Dokument einen Lesezugriff - das Abfragen selbst ist kostenlos. Daten sind dadurch
+# immer aktuell (Verzögerung meist < 1 s), egal wie oft die App neu rendert.
+#
+# wq_patch() schreibt eigene Änderungen sofort in den Speicher (damit man direkt nach einem
+# Schreibzugriff die eigene Änderung sieht); der Listener bestätigt sie kurz danach.
+
+_wq: Dict[str, Dict[str, Any]] = {}
+_wq_lock = threading.Lock()
+_WQ_MAX_AGE = 6 * 3600  # Listener nach 6 h sicherheitshalber neu aufbauen
+
+
+def watched_query(key: str, make_query: Callable[[], Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Liefert [(doc_id, daten), ...] der Collection/Query. Die dicts NICHT verändern - kopieren."""
+    now = time.time()
+    with _wq_lock:
+        e = _wq.get(key)
+        if e is not None and now - e["born"] > _WQ_MAX_AGE:
+            try:
+                e["unsub"].unsubscribe()
+            except Exception:  # noqa: BLE001
+                pass
+            e = None
+        if e is None:
+            e = {"docs": None, "ready": threading.Event(), "born": now}
+
+            def _cb(docs, changes, read_time, _e=e):
+                _e["docs"] = [(d.id, d.to_dict() or {}) for d in docs]
+                _e["ready"].set()
+
+            e["unsub"] = make_query().on_snapshot(_cb)
+            _wq[key] = e
+    if e["docs"] is None:
+        e["ready"].wait(timeout=10)
+    if e["docs"] is None:  # Listener noch nicht bereit -> einmalig normal lesen
+        return [(d.id, d.to_dict() or {}) for d in make_query().stream()]
+    return list(e["docs"])
+
+
+def wq_patch(key: str, doc_id: str, data: Optional[Dict[str, Any]] = None, merge: bool = False) -> None:
+    """Wendet eine eigene Änderung sofort auf den Speicher an (data=None löscht das Dokument)."""
+    e = _wq.get(key)
+    if e is None or e["docs"] is None:
+        return
+    docs = e["docs"]
+    old = next((d for i, d in docs if i == doc_id), None)
+    if data is None:
+        e["docs"] = [(i, d) for i, d in docs if i != doc_id]
+    elif old is None:
+        e["docs"] = [(doc_id, dict(data))] + docs
+    else:
+        new = {**old, **data} if merge else dict(data)
+        e["docs"] = [(i, new) if i == doc_id else (i, d) for i, d in docs]
+
+
+def watched_peek(ref) -> Optional[Dict[str, Any]]:
+    """Wie watched(), legt aber KEINEN neuen Listener an: None, wenn das Dokument nicht überwacht wird."""
+    entry = _watched.get(ref.path)
+    if entry is None or entry["data"] is None:
+        return None
+    return dict(entry["data"])
