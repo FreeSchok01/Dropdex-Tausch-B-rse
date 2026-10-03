@@ -39,6 +39,7 @@ import streamlit as st
 import auth_ui  # Twitch-Login + Admin-Dashboard (siehe auth_ui.py / db.py / twitch_auth.py)
 import chat  # eigenständiges Mini-Modul für den "💬 Chat"-Reiter (siehe chat.py)
 import db  # eigenes Profil je Account + Fortschrittsverlauf (siehe db.py)
+import fb  # Firestore-Verbindung (siehe fb.py)
 import maintenance  # eigenständiges Mini-Modul für den Wartungsmodus (siehe maintenance.py)
 import notifications  # eigenständiges Mini-Modul für den "🔔 News"-Reiter (siehe notifications.py)
 import offers  # eigenständiges Mini-Modul für das öffentliche "🎁 Ich biete"-Board (siehe offers.py)
@@ -563,25 +564,33 @@ DEFAULT_PROFILES = {
 }
 
 
+def _name_map_ref():
+    return fb.get_client().collection("settings").document("profile_names")
+
+
 def load_name_map() -> Dict[str, str]:
-    """Lädt die gespeicherten Profile (URL -> Name/@Handle). Beim allerersten Start werden
-    zwei Beispielprofile vorbelegt, damit die Auswahl nicht leer ist."""
+    """Lädt die gespeicherten Profile (URL -> Name/@Handle) aus Firestore (dauerhaft, auch nach
+    einem Neustart des Hosters). Solange noch nie etwas gespeichert wurde, werden zwei
+    Beispielprofile vorbelegt, damit die Auswahl nicht leer ist. Die Abfrage läuft über einen
+    Live-Listener (kein bezahlter Lesezugriff pro Seitenaufruf)."""
     try:
-        with open(NAME_MAP_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        data = fb.watched(_name_map_ref())
     except Exception:
         return dict(DEFAULT_PROFILES)
+    if "entries" not in data:
+        return dict(DEFAULT_PROFILES)
+    return {e["url"]: e.get("name", "") for e in data["entries"]
+            if isinstance(e, dict) and e.get("url")}
 
 
 def save_name_map(name_map: Dict[str, str]) -> bool:
-    """Speichert die Zuordnung URL -> Name/@Handle dauerhaft in einer JSON-Datei (atomar).
+    """Speichert die Zuordnung URL -> Name/@Handle dauerhaft in Firestore.
     Gibt True zurück, wenn das Speichern geklappt hat."""
-    tmp = NAME_MAP_FILE + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(name_map, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, NAME_MAP_FILE)
+        entries = [{"url": u, "name": n} for u, n in sorted(name_map.items())]
+        ref = _name_map_ref()
+        ref.set({"entries": entries})
+        fb.watched_override(ref, {"entries": entries})
         return True
     except Exception:
         return False
@@ -4632,9 +4641,8 @@ def render_admin_panel(name_map: Dict[str, str], user: Dict[str, Any],
 
                 with st.expander("💾 Backup & Export"):
                     st.caption(
-                        "Gespeichert wird in `dropdex_namen.json` neben der App. Bei Hostern mit flüchtigem Speicher "
-                        "(z. B. manche Cloud-Dienste) kann die Datei bei einem Neustart zurückgesetzt werden – dann die "
-                        "Code-Vorlage unten in `DEFAULT_PROFILES` einfügen oder das Backup wieder einspielen."
+                        "Die Profilliste wird dauerhaft in Firebase (Firestore) gespeichert und übersteht Neustarts. "
+                        "Das Backup hier ist nur eine zusätzliche Sicherheitskopie."
                     )
                     st.download_button("📥 Backup (JSON) herunterladen",
                                        json.dumps(name_map, ensure_ascii=False, indent=2, sort_keys=True),
