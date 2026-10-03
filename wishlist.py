@@ -6,6 +6,9 @@ wishlist.py  (Firestore-Version)
 öffentlich sichtbare Wunschliste setzen. Andere Nutzer sehen das Board und können den
 Wunschgeber direkt über den Chat (siehe chat.py) anschreiben.
 
+Nach jeder Änderung wird match_alerts.check_user() aufgerufen: entsteht dadurch ein neues
+Perfect-Match, bekommen beide Nutzer eine News-Nachricht (und optional eine Discord-Meldung).
+
 Firestore: Sammlung wishes/{user_id}_{hash(card_id)}  (ersetzt den UNIQUE-Constraint:
 pro Nutzer und Karte gibt es genau ein Dokument). Die "id" nach außen ist die Dokument-ID
 (ein String) und wird von der Haupt-App nur durchgereicht (remove_wish(user_id, w["id"])).
@@ -35,6 +38,13 @@ def _sorted_newest_first(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(rows, key=lambda r: r.get("ts") or r.get("created_at") or "", reverse=True)
 
 
+def _check_matches(user_id: int) -> None:
+    """Meldet neue Perfect-Matches. Lokal importiert, um einen Zirkelimport zu vermeiden
+    (match_alerts importiert offers, offers importiert wishlist)."""
+    import match_alerts
+    match_alerts.check_user(user_id)
+
+
 def init_db() -> None:
     """Bleibt aus Kompatibilitätsgründen erhalten - Firestore braucht kein Schema."""
     fb.get_client()
@@ -49,14 +59,16 @@ def add_wish(user_id: int, card_id: str, card_name: str, rarity: str = "", note:
     ref = _col().document(_doc_id(user_id, card_id))
     if ref.get().exists:
         ref.update({"note": note.strip(), "image_url": image_url or ""})
-    else:
-        ref.set({
-            "id": ref.id, "user_id": int(user_id), "card_id": str(card_id), "card_name": card_name,
-            "rarity": rarity, "note": note.strip(), "image_url": image_url or "",
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-        })
+        _cache.clear()
+        return
+    ref.set({
+        "id": ref.id, "user_id": int(user_id), "card_id": str(card_id), "card_name": card_name,
+        "rarity": rarity, "note": note.strip(), "image_url": image_url or "",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+    })
     _cache.clear()
+    _check_matches(user_id)
 
 
 def remove_wish(user_id: int, wish_id: Any) -> None:
@@ -66,6 +78,7 @@ def remove_wish(user_id: int, wish_id: Any) -> None:
     if snap.exists and int(snap.to_dict().get("user_id", -1)) == int(user_id):
         ref.delete()
         _cache.clear()
+        _check_matches(user_id)
 
 
 def get_my_wishes(user_id: int) -> List[Dict[str, Any]]:
