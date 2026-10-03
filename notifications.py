@@ -37,6 +37,22 @@ def _counter_ref(user_id: int):
     return _fs().collection("counters").document(f"news_{int(user_id)}")
 
 
+# Die Liste wird nur neu geladen, wenn sich der Zähler (unread + Versionsnummer "v" im Counter-
+# Dokument, das ohnehin per Live-Listener überwacht wird) geändert hat. Sonst: 0 Lesezugriffe.
+_MAX_ROWS = 100
+_cache: Dict[int, Tuple[Tuple[int, int], List[Dict[str, Any]]]] = {}
+
+
+def _after_write(uid: int, d_unread: int = 0, set_unread: Any = None) -> None:
+    """Nach eigenem Schreibzugriff: Cache leeren und den überwachten Zähler sofort nachziehen."""
+    _cache.pop(int(uid), None)
+    cur = fb.watched_peek(_counter_ref(uid))
+    if cur is None:
+        return
+    un = set_unread if set_unread is not None else max(0, int(cur.get("unread", 0) or 0) + d_unread)
+    fb.watched_override(_counter_ref(uid), {**cur, "unread": un, "v": int(cur.get("v", 0) or 0) + 1})
+
+
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -62,8 +78,10 @@ def add_notification(user_id: int, message: str) -> str:
         "ts": _ts(),
         "is_read": False,
     })
-    batch.set(_counter_ref(user_id), {"unread": firestore.Increment(1)}, merge=True)
+    batch.set(_counter_ref(user_id), {"unread": firestore.Increment(1), "v": firestore.Increment(1)},
+              merge=True)
     batch.commit()
+    _after_write(user_id, +1)
     return f"{int(user_id)}_{ref.id}"
 
 
@@ -77,28 +95,41 @@ def update_message(notification_id: str, message: str) -> None:
     was_read = bool(snap.to_dict().get("is_read"))
     batch = _fs().batch()
     batch.update(ref, {"message": message, "is_read": False})
+    counter = {"v": firestore.Increment(1)}
     if was_read:
-        batch.set(_counter_ref(uid), {"unread": firestore.Increment(1)}, merge=True)
+        counter["unread"] = firestore.Increment(1)
+    batch.set(_counter_ref(uid), counter, merge=True)
     batch.commit()
+    _after_write(uid, +1 if was_read else 0)
 
 
 def get_notifications(user_id: int, limit: int = 200) -> List[Dict[str, Any]]:
-    """Alle Nachrichten für `user_id`, neueste zuerst."""
-    docs = (_col(user_id).order_by("ts", direction=firestore.Query.DESCENDING)
-            .limit(limit).stream())
-    rows = []
-    for d in docs:
-        x = d.to_dict()
-        rows.append({"id": f"{int(user_id)}_{d.id}", "message": x.get("message", ""),
-                     "created_at": x.get("created_at", ""), "is_read": bool(x.get("is_read"))})
-    # Zähler selbst heilen, falls er je vom echten Wert abgewichen ist (nur wenn wir ALLE
-    # Nachrichten gesehen haben, d.h. das Limit nicht erreicht wurde).
-    if len(rows) < limit:
-        real = sum(1 for r in rows if not r["is_read"])
-        if real != unread_count(user_id):
-            _counter_ref(user_id).set({"unread": real})
-            fb.watched_override(_counter_ref(user_id), {"unread": real})
-    return rows
+    """Nachrichten für `user_id`, neueste zuerst (höchstens _MAX_ROWS gespeicherte)."""
+    uid = int(user_id)
+    st = fb.watched(_counter_ref(uid))
+    key = (int(st.get("v", 0) or 0), int(st.get("unread", 0) or 0))
+    hit = _cache.get(uid)
+    if hit and hit[0] == key:
+        rows = hit[1]
+    else:
+        docs = (_col(uid).order_by("ts", direction=firestore.Query.DESCENDING)
+                .limit(_MAX_ROWS).stream())
+        rows = []
+        for d in docs:
+            x = d.to_dict()
+            rows.append({"id": f"{uid}_{d.id}", "message": x.get("message", ""),
+                         "created_at": x.get("created_at", ""), "is_read": bool(x.get("is_read"))})
+        # Zähler selbst heilen, falls er je vom echten Wert abweicht (nur wenn wir ALLE
+        # Nachrichten gesehen haben).
+        if len(rows) < _MAX_ROWS:
+            real = sum(1 for r in rows if not r["is_read"])
+            if real != key[1]:
+                _counter_ref(uid).set({"unread": real, "v": firestore.Increment(1)}, merge=True)
+                _after_write(uid, set_unread=real)
+                st = fb.watched(_counter_ref(uid))
+                key = (int(st.get("v", 0) or 0), int(st.get("unread", 0) or 0))
+        _cache[uid] = (key, rows)
+    return [dict(r) for r in rows[:limit]]
 
 
 def unread_count(user_id: int) -> int:
@@ -113,8 +144,10 @@ def mark_read(notification_id: str) -> None:
         return
     batch = _fs().batch()
     batch.update(ref, {"is_read": True})
-    batch.set(_counter_ref(uid), {"unread": firestore.Increment(-1)}, merge=True)
+    batch.set(_counter_ref(uid), {"unread": firestore.Increment(-1), "v": firestore.Increment(1)},
+              merge=True)
     batch.commit()
+    _after_write(uid, -1)
 
 
 def mark_all_read(user_id: int) -> None:
@@ -126,6 +159,6 @@ def mark_all_read(user_id: int) -> None:
         if n % 400 == 0:
             batch.commit()
             batch = _fs().batch()
-    batch.set(_counter_ref(user_id), {"unread": 0})
+    batch.set(_counter_ref(user_id), {"unread": 0, "v": firestore.Increment(1)}, merge=True)
     batch.commit()
-    fb.watched_override(_counter_ref(user_id), {"unread": 0})
+    _after_write(user_id, set_unread=0)
