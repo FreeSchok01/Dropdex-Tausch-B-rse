@@ -4325,7 +4325,14 @@ def my_profile_picker(user: Dict[str, Any]) -> Tuple[str, str]:
         )
     can_save = bool(url.strip() and name.strip())
     if st.button("💾 Eigenes Profil speichern", key="myprofile_save", disabled=not can_save):
-        db.set_own_profile(user["id"], url.strip(), name.strip())
+        try:
+            db.set_own_profile(user["id"], url.strip(), name.strip())
+            _check = db.get_user_by_id(user["id"]) or {}
+            if (_check.get("own_profile_url") or "") != url.strip():
+                raise RuntimeError("Wert wurde nicht in der Datenbank gefunden (Rücklese-Prüfung).")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"⚠️ Eigenes Profil konnte nicht gespeichert werden: {exc}")
+            st.stop()
         st.session_state["auth_user"]["own_profile_url"] = url.strip()
         st.session_state["auth_user"]["own_profile_name"] = name.strip()
         st.session_state.pop("myprofile_editing", None)
@@ -5555,6 +5562,21 @@ def main() -> None:
         '</div>',
         unsafe_allow_html=True,
     )
+
+    # ---- Sicherheitscheck: laufen wirklich alle Module in der Firestore-Version? Eine alte
+    # SQLite-Datei im Repo speichert nur flüchtig und geht bei jedem Neustart verloren. ----
+    _outdated = [name for name, mod, marker in (
+        ("db.py", db, "_fs"), ("chat.py", chat, "_conv_ref"), ("wishlist.py", wishlist, "_doc_id"),
+        ("offers.py", offers, "_doc_id"), ("notifications.py", notifications, "_counter_ref"),
+        ("trade_watch.py", trade_watch, "_snap_ref"), ("maintenance.py", maintenance, "_ref"),
+    ) if not hasattr(mod, marker)]
+    if _outdated:
+        st.error(
+            "⚠️ Diese Dateien im Repo sind noch die alte SQLite-Version und speichern nur flüchtig "
+            "(Daten gehen beim Neustart verloren): **" + ", ".join(_outdated) + "**. "
+            "Bitte durch die Firestore-Versionen ersetzen."
+        )
+        return
 
     # ---- Twitch-Login-Gate: ohne Login bzw. bei Bann geht es hier nicht weiter ----
     if not auth_ui.render_login_gate():
